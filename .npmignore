@@ -1,0 +1,15 @@
+# .npmignore —— 双保险
+#
+# 即使 package.json 的 files 字段某天被改宽，这些也绝不能被发出去：
+#   app/data/  是**用户的真实数据**：记忆库 + 配置文件（里面可能有 API key）
+#   test/      只是开发资源，发了会撑大包体
+#
+# 教训：files 里写 "app" 会把整个 app 目录连 app/data 一起打包，
+# 实测一次 npm pack 就带出了 dsh-local-memory.db 和含密钥的 v2-config.json。
+
+app/data/
+app/data
+test/
+*.log
+.DS_Store
+Thumbs.db
