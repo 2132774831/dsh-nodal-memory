@@ -29,13 +29,25 @@ const SWITCH_PAIRS = [
   ['上行', '下行'], ['推荐', '不推荐'], ['必须', '禁止'],
 ];
 
-/** 抽出"关键值"：版本号、路径、端口、纯数字 —— 同一主题下这些不同，八成是状态变了 */
+/**
+ * 抽出"关键值"：版本号、路径、端口、**数字+单位** —— 同一主题下这些不同，八成是状态变了。
+ *
+ * 「数字+单位」是后补的：一开始只认版本号和 Windows 路径，结果"超时 30 秒"和
+ * "超时 45 秒"这种最常见的冲突完全抓不到（demo 数据实测 0 对）。
+ * 中文技术文档里大量参数是"30 秒 / 5 分钟 / 80% / 512MB"这种形态，必须覆盖。
+ */
+const UNIT_RE = /(\d+(?:\.\d+)?)\s*(毫秒|秒|分钟|小时|天|周|个月|次|条|个|人|份|台|层|行|GB|MB|KB|TB|ms|px|%|℃)/gi;
+
 function keyValues(text) {
   const s = String(text || '');
   const out = new Set();
   for (const m of s.matchAll(/\d+\.\d+(?:\.\d+)*/g)) out.add('v:' + m[0]);
   for (const m of s.matchAll(/[A-Za-z]:\\[^\s，。；、）)]+/g)) out.add('p:' + m[0].toLowerCase());
   for (const m of s.matchAll(/端口\s*[:：]?\s*(\d{2,5})/g)) out.add('port:' + m[1]);
+  // 数字+单位：把单位统一成小写，'30 秒' 与 '30秒' 视为同一个值
+  for (const m of s.matchAll(UNIT_RE)) {
+    out.add('n:' + m[1] + m[2].toLowerCase());
+  }
   return out;
 }
 

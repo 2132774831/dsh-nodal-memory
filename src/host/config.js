@@ -89,9 +89,40 @@ export const DEFAULTS = {
     // 写入时按内容粗分 工作/偏好/情感。kind 决定半衰期，全落在 unknown 就失去了意义。
     // 误判可以随时在补标页改，所以默认开。
     autoKind: true,
+    /**
+     * 软遗忘：长期没用过的低价值记忆**只降权、不删除**。
+     * 关掉 = 排序完全不看"闲置多久"。
+     * 对应数字是 forgetAfterDays（见上）。
+     */
+    softForget: true,
+  },
+  /** 闲置多少天后开始给低价值记忆降权（只影响排序，永不删数据） */
+  forgetAfterDays: 180,
+
+  /**
+   * 各类记忆的衰减半衰期（天）。这是整套设计里最该让用户自己调的旋钮：
+   * 有人希望"情绪一百年都不忘"，也有人希望"上个月的心情就别再提了"。
+   * 默认值来自 core/time.js 的 HALF_LIFE_DAYS，改这里只影响检索排序，不改数据。
+   */
+  halfLifeDays: {
+    work: 365,
+    preference: 730,
+    emotion: 60,
+    unknown: 365,
   },
   /** 冲突检测灵敏度：strict 严（少而准）/ normal 标准 / loose 松（多而杂） */
   conflictSensitivity: 'normal',
+
+  /**
+   * 隐私。
+   *
+   * maskPII 默认**开**：记忆库是明文文件，而且一旦开语义检索，正文还会发到外部
+   * embedding 端点。用户把 key/手机号粘进对话里是常事，不脱敏等于长期留隐患。
+   * 关掉是给"我就是要存完整原文"的人留的口子——代价自负。
+   */
+  privacy: {
+    maskPII: true,
+  },
 };
 
 const BOOL_KEYS = ['enabled', 'autoRecall', 'autoTagProject', 'injectBrief'];
@@ -100,6 +131,7 @@ const RANGES = {
   autoRecallMinChars: [0, 500],
   reviewIntervalDays: [0, 3650],
   maintenanceIntervalDays: [1, 365],
+  forgetAfterDays: [30, 3650],
   maxTextLength: [100, 20000],
 };
 
@@ -112,6 +144,8 @@ export function normalizeConfig(input) {
     ...DEFAULTS,
     embedding: { ...DEFAULTS.embedding },
     features: { ...DEFAULTS.features },
+    privacy: { ...DEFAULTS.privacy },
+    halfLifeDays: { ...DEFAULTS.halfLifeDays },
   };
   const src = input && typeof input === 'object' ? input : {};
 
@@ -139,6 +173,26 @@ export function normalizeConfig(input) {
         feat[fk] = typeof f[fk] === 'boolean' ? f[fk] : def;
       }
       out.features = feat;
+      continue;
+    }
+
+    if (key === 'privacy') {
+      const p = value && typeof value === 'object' ? value : {};
+      // 注意：这里**不是** `p.maskPII === true`。
+      // 隐私开关默认开，配置里写坏/没写都必须落到"开"，只有显式 false 才关。
+      out.privacy = { maskPII: p.maskPII !== false };
+      continue;
+    }
+
+    if (key === 'halfLifeDays') {
+      const h = value && typeof value === 'object' ? value : {};
+      const merged = { ...DEFAULTS.halfLifeDays };
+      for (const k of Object.keys(DEFAULTS.halfLifeDays)) {
+        const n = Number(h[k]);
+        // 半衰期是除数，写坏（0/负数/NaN）会让整类记忆瞬间消失，所以一律夹到合法区间
+        if (Number.isFinite(n)) merged[k] = Math.min(3650, Math.max(7, Math.round(n)));
+      }
+      out.halfLifeDays = merged;
       continue;
     }
 
@@ -171,7 +225,10 @@ export function readConfig() {
     const raw = fs.readFileSync(configFile(), 'utf8');
     return normalizeConfig(JSON.parse(raw));
   } catch {
-    return { ...DEFAULTS, embedding: { ...DEFAULTS.embedding } };
+    // 走 normalizeConfig 而不是直接 {...DEFAULTS}：
+    // 后者会把 features/privacy 这两个**对象字段共享引用**出去，
+    // 谁改了 cfg.features 就等于改了全局默认值（下面的会话全跟着变）。
+    return normalizeConfig({});
   }
 }
 

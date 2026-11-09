@@ -16,14 +16,18 @@
  *   hits        → accessCount + searchedCount（v1 的 hits 是"被检索命中次数"）
  *   lastUsedAt  → lastAccessed
  *
- * 两个需要判断的地方（都选了保守策略）：
- *   kind：v1 没有分类。带 pref 标签的判为 preference，其余一律 unknown。
- *         不猜 work/emotion——猜错比不猜更有害，留给后续"补标"流程。
- *   importance：v1 没有重要度。全部 important（这些条目都是用户确认过的长期记忆），
- *         语义上"重要"比"随便"更接近事实。
+ * 两个需要判断的地方：
+ *   kind：v1 没有分类，只有"带 pref 标签 → preference"这一条。
+ *         现在接上 v2 的纯本地分类器（证据不足仍返回 unknown，不瞎猜）——
+ *         否则迁移完 17 条全 unknown，"情感忘得快/偏好记得久"这套设计等于空转。
+ *   importance：v1 没有重要度。**全部 important**（这些条目都是用户确认过的长期记忆）。
+ *         v2 的枚举是 key/important/casual/transient，没有"中间档"，硬造一个 normal
+ *         会连累检索权重和界面文案；而"被用户确认过的长期记忆"语义上就是 important。
+ *         代价是迁移来的这批在"重要度"这个维度上没有区分度，需要时用「补标」逐条重评。
  */
 
 import { toMs, toIso } from './time.js';
+import { inferKindFromContent } from './classify.js';
 
 /** 工程里 project 字段出现过两种写法，统一成连字符版 */
 export function normalizeProject(p) {
@@ -86,7 +90,12 @@ export function migrateFromV1(store, v1, opts = {}) {
       const createdAt = toMs(src.createdAt) ?? toMs(src.updatedAt) ?? Date.now();
       const updatedAt = toMs(src.updatedAt) ?? createdAt;
       const hits = Number.isFinite(src.hits) ? src.hits : 0;
-      const kind = inferKind(src);
+      // v1 只有"带 pref 标签才算偏好"这一条规则，其余全 unknown → 迁移后分类维度等于白给。
+      // 这里接上 v2 已有的纯本地分类器（证据不足仍返回 unknown，不瞎猜）。
+      // ⚠ inferKindFromContent 返回的是 {kind, why}，不是字符串 —— 直接当字符串赋给 kind
+      //   会把对象写进记录，统计里全落进 unknown（踩过）。
+      const tagged = inferKind(src);
+      const kind = tagged !== 'unknown' ? tagged : inferKindFromContent(text).kind;
       const project = normalizeProject(src.project);
       const tags = Array.isArray(src.tags) ? src.tags : [];
 

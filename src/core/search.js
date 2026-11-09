@@ -25,6 +25,47 @@ import { cosine } from './embed.js';
 const DEFAULT_MIN_COVERAGE = 0.5;
 
 /**
+ * 软遗忘：**永不删除**，只让它越来越靠后。
+ *
+ * 为什么不物理删：删记忆是不可逆的，误判一次就永远找不回来。
+ * 而且"没用过"不等于"没用"——有些结论一年才用一次，删了就再也想不起来。
+ *
+ * 规则（只对"低价值类"生效）：
+ *   - 只看 importance 是 casual/transient 的，或者 kind 是 emotion 的
+ *     （key/important 永远不降——那是用户确认过要长期保留的）
+ *   - 计的是"最后一次被用到"到现在的空闲天数，不是创建时间：
+ *     一条老记忆只要经常被检索到，就不该被压
+ *   - 超过 forgetAfterDays 后线性加重，最低压到 0.4 倍，**不会归零**
+ */
+/**
+ * 计算"这条记忆有多新"用的时钟。
+ *
+ * ⚠ 必须取 max(创建, 更新)：一条 400 天前写的记忆如果昨天刚被追加过进展，
+ * 它承载的信息是新鲜的。只看 createdAt 会把它当死数据——
+ * 这是外部评审（Kimi）点出来的真 bug。
+ */
+function activityAt(record) {
+  return Math.max(record.createdAt || 0, record.updatedAt || 0) || null;
+}
+
+function neglectFactor(record, now, { softForget, forgetAfterDays }) {
+  if (!softForget) return 1;
+  const lowValue = record.importance === 'casual'
+    || record.importance === 'transient'
+    || record.kind === 'emotion';
+  if (!lowValue) return 1;
+
+  const lastUse = record.lastAccessed ?? record.createdAt;
+  if (!lastUse) return 1;
+  const idleDays = (now - lastUse) / 86400000;
+  if (idleDays <= forgetAfterDays) return 1;
+
+  // 超期多久：刚过线 0 → 再过一倍 1
+  const over = Math.min(1, (idleDays - forgetAfterDays) / Math.max(1, forgetAfterDays));
+  return 1 - 0.6 * over;   // 0.4 ~ 1
+}
+
+/**
  * 覆盖率阈值随查询长度自适应。
  * 短查询（≤4 token）要求一半命中，长句放宽——因为没人会把一整句话复述进记忆里，
  * 长句查询如果用同样的阈值会全军覆没。
@@ -75,6 +116,9 @@ export function search(store, query, opts = {}) {
     filters = {},
     now = Date.now(),
     queryVector = null,
+    softForget = true,
+    forgetAfterDays = 180,
+    halfLifeDays = null,
   } = opts;
 
   const q = String(query ?? '').trim();
@@ -166,17 +210,31 @@ export function search(store, query, opts = {}) {
     }
 
     const impFactor = 0.6 + 0.4 * (IMPORTANCE_WEIGHT[item.record.importance] ?? 0.8);
-    const decay = decayFactor(item.record.createdAt, item.record.kind, now);
-    const usage = 1 + 0.15 * Math.log1p(item.record.accessCount);
-    const score = relevance * impFactor * decay * usage;
+    const clock = activityAt(item.record);
+    const decay = decayFactor(clock, item.record.kind, now, halfLifeDays);
+    // 频次加成**不含自动注入**：注入本来就是因为检索命中，再拿它加权会形成
+    // "注入 → 加分 → 更容易被注入" 的自增强回路（外部评审点出的真问题）。
+    // 只认模型主动检索，自动注入按 0.3 折算，并且整体封顶 2 倍，不让它无限涨。
+    const usageRaw = 1 + 0.15 * Math.log1p(
+      (item.record.searchedCount || 0) + 0.3 * (item.record.injectedCount || 0),
+    );
+    const usage = Math.min(2, usageRaw);
+    // 软遗忘只压排序，不删数据、也不把 score 归零
+    const neglect = neglectFactor(item.record, now, { softForget, forgetAfterDays });
+    // 衰减和软遗忘都是时间惩罚，**不能相乘**（等于对"又老又没人用"判两次刑：
+    // 实测 work 类 180 天会掉到 0.28、emotion 掉到 0.05，等于变相删除）。
+    // 但 neglect === 1 表示"这条不适用软遗忘"，此时只用 decay——
+    // 直接写 max(decay, neglect) 会让所有记忆的 decay 都被 1 抵消掉（踩过）。
+    const timeFactor = neglect < 1 ? Math.max(decay, neglect) : decay;
+    const score = relevance * impFactor * timeFactor * usage;
 
     // 精确覆盖（查询的每个 token 都命中）不该因为"旧"而彻底消失——
     // 用户拿原话去搜，就该给他，哪怕这条很老。衰减只该让它往后排（score 里已经体现）。
     const exactHit = cov.total > 0 && cov.matched === cov.total;
     if (score < minScore && !exactHit) continue;
 
-    const rel = formatRelative(item.record.createdAt, now);
-    const fresh = freshness(item.record.createdAt, now);
+    const rel = formatRelative(clock, now);
+    const fresh = freshness(clock, now);
     if (!includeStale && fresh.stale) continue;
 
     results.push({
@@ -192,6 +250,9 @@ export function search(store, query, opts = {}) {
         importanceFactor: Number(impFactor.toFixed(3)),
         decay: Number(decay.toFixed(3)),
         usage: Number(usage.toFixed(3)),
+        // <1 说明被软遗忘压过：数据还在，只是排后面了（界面可以画得淡一点）
+        neglect: Number(neglect.toFixed(3)),
+        forgotten: neglect < 0.999,
         ageLabel: rel.label,
         ageLevel: rel.level,
         days: Math.floor(rel.days),
@@ -202,29 +263,17 @@ export function search(store, query, opts = {}) {
   }
 
   results.sort((a, b) => b.score - a.score);
-  return results.slice(0, limit);
-}
 
-/**
- * 把检索结果渲染成注入上下文用的紧凑文本。
- * 目标是"信息密度高、歧义少"：时间 + 项目 + 正文 + 标签，不塞打分细节。
- * 时效警告单独一行，确保模型不会忽略。
- */
-export function renderHits(results, { now = Date.now(), maxChars = 180 } = {}) {
-  if (!results || results.length === 0) return '';
-  const lines = [];
-  results.forEach((r, i) => {
-    const rec = r.record;
-    const rel = formatRelative(rec.createdAt, now);
-    const head = `${i + 1}. [${rel.label}]`;
-    const meta = [];
-    if (rec.project) meta.push(rec.project);
-    if (rec.kind !== 'unknown') meta.push(rec.kind);
-    if (rec.tags.length) meta.push(rec.tags.join(','));
-    let body = rec.content.replace(/\s+/g, ' ').trim();
-    if (body.length > maxChars) body = body.slice(0, maxChars) + '…';
-    lines.push(`${head}${meta.length ? ' (' + meta.join(' | ') + ')' : ''} ${body}`);
-    if (r.why.staleWarning) lines.push(`   ⚠ ${r.why.staleWarning}`);
-  });
-  return lines.join('\n');
+  /**
+   * 整合去重：如果归纳条（父）和它的碎片（子，status=consolidated）同时命中，
+   * 只保留父条——否则同一件事在结果里出现两次（一条结论 + 一条原始碎片），
+   * 白占位置、还让模型以为是两件事。
+   *
+   * 注意**不是隐藏**：碎片单独被命中时照样返回（它仍是可查的证据），
+   * 只有"父也命中"时才让位。
+   */
+  const hitParents = new Set(results.map((r) => r.record.id));
+  const deduped = results.filter((r) => !(r.record.parentId && hitParents.has(r.record.parentId)));
+
+  return deduped.slice(0, limit);
 }

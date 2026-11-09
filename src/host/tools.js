@@ -47,7 +47,7 @@ function defineTool(spec) {
  * maxChars 控制正文截断长度：列表页是"概览"，截短；搜索结果要能读细节，放宽。
  * 不截断的话，list 20 条长记忆能吃掉上万 token，纯属浪费。
  */
-function renderRecord(rec, index, { now = Date.now(), maxChars = 200 } = {}) {
+function renderRecord(rec, index, { now = Date.now(), maxChars = 200, updates = null } = {}) {
   const rel = formatRelative(rec.createdAt, now);
   const meta = [];
   if (rec.project) meta.push(rec.project);
@@ -56,7 +56,15 @@ function renderRecord(rec, index, { now = Date.now(), maxChars = 200 } = {}) {
   const tags = rec.tags && rec.tags.length ? ` [${rec.tags.join(', ')}]` : '';
   let body = rec.content.replace(/\s+/g, ' ').trim();
   if (body.length > maxChars) body = body.slice(0, maxChars) + '…';
-  return `${index}. [${rel.label}]${meta.length ? ' (' + meta.join(' | ') + ')' : ''} ${body}${tags}  —— id=${rec.id}`;
+  const head = `${index}. [${rel.label}]${meta.length ? ' (' + meta.join(' | ') + ')' : ''} ${body}${tags}  —— id=${rec.id}`;
+  // 有后续进展就要显示出来——否则 memory_update 等于写了个没人看的归档。
+  // 只带最新一条（够判断"现在怎么样了"），并标出总数。
+  if (updates && updates.length) {
+    const last = updates[updates.length - 1];
+    const tail = updates.length > 1 ? `（共 ${updates.length} 条进展）` : '';
+    return head + `\n   ↳ 后续进展 ${formatRelative(last.at, now).label}：${last.text}${tail}`;
+  }
+  return head;
 }
 
 function fmtDate(ms) {
@@ -133,6 +141,21 @@ const REVIEW_SCHEMA = {
   properties: {
     staleDays: { type: 'integer', minimum: 1, maximum: 3650, description: '多久没更新算「陈旧」，默认 180 天。' },
     neverUsedDays: { type: 'integer', minimum: 1, maximum: 3650, description: '创建多久仍是 0 命中算「从没用上」，默认 30 天。' },
+  },
+};
+
+const UPDATE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['id', 'text'],
+  properties: {
+    id: { type: 'string', description: '要补充进展的记忆 id（来自 memory_list / memory_search）。' },
+    text: { type: 'string', description: '这次的新进展，一句话说清「现在怎么样了」。原记忆不会被改写。' },
+    status: {
+      type: 'string',
+      enum: ['active', 'resolved', 'expired', 'superseded'],
+      description: '可选：顺手更新这条记忆的整体状态。事情办完了用 resolved。',
+    },
   },
 };
 
@@ -249,7 +272,7 @@ export function buildTools(deps) {
           if (guess.kind !== 'unknown') { kind = guess.kind; kindGuess = guess.why; }
         }
 
-        const { id, record } = store.put({
+        const { id, record, masked } = store.put({
           content,
           tags,
           project,
@@ -263,7 +286,9 @@ export function buildTools(deps) {
           try { await deps.ensureVector(store, record); } catch { /* 忽略 */ }
         }
         notifyWrite();
-        return `已记住（id=${id}）${record.project ? `，项目标签：${record.project}` : ''}${record.kind !== 'unknown' ? `，类别：${record.kind}` : ''}。`;
+        // 脱敏了要明说：否则模型会以为自己存的是原文，回头引用时对不上
+        const maskNote = masked ? '，其中敏感信息已脱敏（形如 [已脱敏:手机号]）' : '';
+        return `已记住（id=${id}）${record.project ? `，项目标签：${record.project}` : ''}${record.kind !== 'unknown' ? `，类别：${record.kind}` : ''}${maskNote}。`;
       },
     }),
 
@@ -293,13 +318,19 @@ export function buildTools(deps) {
           try { queryVector = await deps.embedQuery(query); } catch { queryVector = null; }
         }
 
-        let results = coreSearch(store, query, { limit, filters, queryVector });
+        // 软遗忘（降权不删）也跟着配置走
+        const forgetOpts = {
+          softForget: cfg.features?.softForget !== false,
+          forgetAfterDays: cfg.forgetAfterDays,
+          halfLifeDays: cfg.halfLifeDays,
+        };
+        let results = coreSearch(store, query, { limit, filters, queryVector, ...forgetOpts });
 
         // 多标签时逐个再查一遍再合并（filters.tag 只支持单个，不为这个把存储层搞复杂）
         if (Array.isArray(args.tags) && args.tags.length > 1) {
           const seen = new Set(results.map((r) => r.record.id));
           for (const tag of args.tags) {
-            for (const r of coreSearch(store, query, { limit, filters: { ...filters, tag: String(tag) }, queryVector })) {
+            for (const r of coreSearch(store, query, { limit, filters: { ...filters, tag: String(tag) }, queryVector, ...forgetOpts })) {
               if (!seen.has(r.record.id)) {
                 seen.add(r.record.id);
                 results.push(r);
@@ -323,7 +354,10 @@ export function buildTools(deps) {
           store.recordCooccur(results.map((r) => r.record.id));
         }
         const lines = [`找到 ${results.length} 条相关记忆（库里共 ${total} 条）：`, ''];
-        results.forEach((r, i) => lines.push(renderRecord(r.record, i + 1, { maxChars: 400 })));
+        results.forEach((r, i) => lines.push(renderRecord(r.record, i + 1, {
+          maxChars: 400,
+          updates: store.getUpdates ? store.getUpdates(r.record.id) : null,
+        })));
         const staleCount = results.filter((r) => r.why.stale).length;
         if (staleCount) lines.push('', `注意：其中 ${staleCount} 条距今超过半年，如与当前情况冲突请以现状为准。`);
         return lines.join('\n');
@@ -342,7 +376,10 @@ export function buildTools(deps) {
         const records = store.list({ limit, tag: args.tag ? String(args.tag) : undefined });
         if (!records.length) return '记忆库还是空的。';
         const lines = [`最近的 ${records.length} 条记忆（库里共 ${store.count()} 条）：`, ''];
-        records.forEach((rec, i) => lines.push(renderRecord(rec, i + 1, { maxChars: 160 })));
+        records.forEach((rec, i) => lines.push(renderRecord(rec, i + 1, {
+          maxChars: 160,
+          updates: store.getUpdates ? store.getUpdates(rec.id) : null,
+        })));
         return lines.join('\n');
       },
     }),
@@ -360,6 +397,33 @@ export function buildTools(deps) {
         if (!id) return '没有传入要删除的 id。';
         const ok = getStore().remove(id);
         return ok ? `已删除 ${id}（软删，可恢复）。` : `没找到 id=${id} 的记忆（可能已经被删过了）。`;
+      },
+    }),
+
+    defineTool({
+      name: 'memory_update',
+      description:
+        '给一条旧记忆补充「后续进展」，例如之前记了「电脑坏了」，现在用户说「买了新的」。'
+        + '**原记忆不会被改写**（历史要留着），进展追加在后面，检索时会一起看到。'
+        + '当用户交代了某件旧事的现状、或事情办完了，就用它。',
+      parameters: UPDATE_SCHEMA,
+      concurrencySafe: () => false,
+      run: async (args) => {
+        const cfg = getConfig();
+        if (!cfg.enabled) return disabled();
+        const id = String(args.id || '').trim();
+        const text = String(args.text || '').trim();
+        if (!id) return '没有传入记忆 id。';
+        if (!text) return '没有传入要补充的内容。';
+        const store = getStore();
+        const status = args.status ? String(args.status) : null;
+        const updates = store.addUpdate(id, { text, status });
+        if (!updates) return `没找到 id=${id} 的记忆（可能已经被删了）。`;
+        const rec = store.get(id);
+        const lines = [`已给 ${id} 追加第 ${updates.length} 条进展：${text}`];
+        if (status) lines.push(`状态改成：${status}`);
+        if (rec) lines.push(`原记忆仍是：${String(rec.content).slice(0, 80)}${String(rec.content).length > 80 ? '…' : ''}`);
+        return lines.join('\n');
       },
     }),
 

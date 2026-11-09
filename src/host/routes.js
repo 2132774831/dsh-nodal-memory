@@ -18,8 +18,10 @@ import { search } from '../core/search.js';
 import { runMaintenance, maintenanceInfo } from '../core/maintenance.js';
 import { findConflicts, reviewCandidates } from '../core/insight.js';
 import { inferKindFromContent, classifyBatch } from '../core/classify.js';
+import { findConsolidationGroups, applyConsolidation } from '../core/consolidate.js';
 import { getEmbedder, backfillVectors, queryVectorFor } from './embedding.js';
 import { reviewStore } from './tools.js';
+import { ensureAppRunning } from './app-link.js';
 
 export const ROUTE_BASE = '/' + NS;
 const MAX_BODY = 512 * 1024;
@@ -165,6 +167,23 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
     const method = (req.method || 'GET').toUpperCase();
     const query = Object.fromEntries(url.searchParams.entries());
 
+    /* GET /open —— 打开完整记忆界面。
+     * 没在跑就先拉起来（用 DSH 自带的 Node，用户不需要装 Node），再 302 跳过去。
+     * 关系图/卡片视图/直觉/设置都在那个界面里，插件这边不重画。 */
+    if (parts.length === 1 && parts[0] === 'open' && method === 'GET') {
+      // 独立软件自己就是那个界面：直接回根路径，别去拉起第二个自己
+      if (ctx && ctx.isStandaloneApp) {
+        res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      const r = await ensureAppRunning({ log: (m) => console.warn('[local-memory] ' + m) });
+      if (!r.ok) return sendJson(res, 503, { ok: false, error: r.error });
+      res.writeHead(302, { Location: r.url, 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+
     try {
       const store = getStore();
       const config = readConfig();
@@ -239,7 +258,15 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           // 配了 embedding 就用查询向量（拿不到就退回纯关键词）——
           // 之前这里没传，导致网页搜索其实是纯关键词，语义层等于白开
           const queryVector = await queryVectorFor(query.q);
-          const hits = search(store, query.q, { limit, filters, queryVector });
+          // 软遗忘（降权不删）跟着配置走。注意这里必须自己读配置——
+          // 上面几个分支各自 `const cfg`，本分支作用域里没有它（写成 cfg.xxx 会直接 ReferenceError）
+          const cfgForSearch = readConfig();
+          const hits = search(store, query.q, {
+            limit, filters, queryVector,
+            softForget: cfgForSearch.features?.softForget !== false,
+            forgetAfterDays: cfgForSearch.forgetAfterDays,
+            halfLifeDays: cfgForSearch.halfLifeDays,
+          });
           return sendJson(res, 200, {
             ok: true,
             total: store.count(),
@@ -256,6 +283,11 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           tag: query.tag,
           includeDeleted,
         });
+        // 带上"有几条进展"，列表页才能显示徽标。一次批量查，不要 N+1
+        if (typeof store.updateCounts === 'function') {
+          const counts = store.updateCounts(memories.map((r) => r.id));
+          for (const r of memories) r.updatesCount = counts.get(r.id) ?? 0;
+        }
         return sendJson(res, 200, { ok: true, total: store.count(), memories });
       }
 
@@ -294,7 +326,7 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           topic: body.topic,
           source: 'ui',
         });
-        return sendJson(res, 200, { ok: true, id: out.id, created: out.created, kindWhy, memory: out.record });
+        return sendJson(res, 200, { ok: true, id: out.id, created: out.created, masked: out.masked === true, kindWhy, memory: out.record });
       }
 
       /* /memories/:id —— 读 / 更新 / 软删；/memories/:id/restore|purge —— 恢复 / 彻底删 */
@@ -305,11 +337,29 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
         if (parts.length === 2 && method === 'GET') {
           const rec = store.get(id);
           if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
-          return sendJson(res, 200, { ok: true, memory: rec });
+          // 带上进展时间轴：原记录 + 后续补充一起看才是完整的
+          return sendJson(res, 200, { ok: true, memory: rec, updates: store.getUpdates(id) });
         }
 
         if (parts.length === 3) {
           const action = parts[2];
+
+          /* POST /memories/:id/updates —— 追加一条进展（append-only，不改原文） */
+          if (action === 'updates') {
+            if (method === 'GET') {
+              if (!store.get(id)) return sendJson(res, 404, { ok: false, error: 'not found' });
+              return sendJson(res, 200, { ok: true, updates: store.getUpdates(id) });
+            }
+            if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+            const body = JSON.parse(await readBody(req) || '{}');
+            const text = String(body.text ?? '').trim();
+            if (!text) return sendJson(res, 400, { ok: false, error: 'text 不能为空' });
+            const status = body.status ? String(body.status) : null;
+            const updates = store.addUpdate(id, { text, status });
+            if (!updates) return sendJson(res, 404, { ok: false, error: 'not found' });
+            return sendJson(res, 200, { ok: true, updates, memory: store.get(id) });
+          }
+
           if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
           const existing = store.get(id);
           if (!existing) return sendJson(res, 404, { ok: false, error: 'not found' });
@@ -348,7 +398,23 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           next.updatedAt = Date.now();
           if (!next.content) return sendJson(res, 400, { ok: false, error: 'content 不能为空' });
 
+          const contentChanged = body.content !== undefined && next.content !== existing.content;
+
           store.put(next);
+
+          // 正文改了就必须重算向量：向量是按旧文本算的，不重算的话
+          // 语义检索会一直拿"上一版内容"去比对，而且**完全不报错**（静默腐坏）。
+          if (contentChanged) {
+            try {
+              const emb = getEmbedder();
+              if (emb && emb.enabled && emb.hasKey() && typeof emb.embedOne === 'function') {
+                const r = await emb.embedOne(next.content);
+                if (r && r.ok && Array.isArray(r.vector)) {
+                  store.putVector(id, { model: emb.model, vec: r.vector });
+                }
+              }
+            } catch { /* 向量算不出来不影响保存本身 */ }
+          }
           return sendJson(res, 200, { ok: true, memory: store.get(id) });
         }
 
@@ -425,12 +491,15 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
         const cfg = readConfig();
         const feat = cfg.features || {};
         const all = store.list({ limit: parseInt_(query.limit, 2000, 1, 20000) });
+        // 已被整合的碎片（status=consolidated）不再参与"该想起的"和冲突检测：
+        // 它们已经被归纳成结论了，再提醒一次等于重复打扰。
+        const active = all.filter((r) => r.status !== 'consolidated');
 
         if (feat.conflictScan === false && feat.dueReview === false) {
           return sendJson(res, 200, { ok: true, conflicts: [], dueReview: [], disabled: true });
         }
 
-        const ids = all.map((r) => r.id);
+        const ids = active.map((r) => r.id);
         let vectors = null;
         if (typeof store.getVectors === 'function') {
           const have = store.getVectors(ids);
@@ -446,13 +515,13 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
 
         const conflicts = feat.conflictScan === false
           ? { pairs: [], skipped: '已关闭' }
-          : findConflicts(all, {
+          : findConflicts(active, {
             vectors,
             limit: parseInt_(query.maxConflicts, 30, 1, 100),
             minOverlap: Number.isFinite(Number(query.minOverlap)) ? Number(query.minOverlap) : sens.minOverlap,
             minSemantic: Number.isFinite(Number(query.minSemantic)) ? Number(query.minSemantic) : sens.minSemantic,
           });
-        const dueReview = feat.dueReview === false ? [] : reviewCandidates(all, {
+        const dueReview = feat.dueReview === false ? [] : reviewCandidates(active, {
           limit: parseInt_(query.reviewLimit, 8, 1, 50),
           minDays: parseInt_(query.minDays, 14, 0, 3650),
         });
@@ -463,6 +532,30 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           dueReview,
           sensitivity: cfg.conflictSensitivity || 'normal',
         });
+      }
+
+      /* /consolidate —— 记忆整合：同一主题反复出现的碎片，合成一条高阶结论
+       * GET  预览候选（不动数据）
+       * POST { dryRun:true } 只看；{ dryRun:false, id } 才真的落库 */
+      if (parts.length === 1 && parts[0] === 'consolidate') {
+        const records = store.list({ limit: 100000 });
+        if (method === 'GET') {
+          const out = findConsolidationGroups(records, { minGroupSize: parseInt_(query.min, 3, 2, 20) });
+          return sendJson(res, 200, { ok: true, dryRun: true, groups: out.groups });
+        }
+        if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        const body = JSON.parse(await readBody(req) || '{}');
+        if (body.dryRun !== false) {
+          const out = findConsolidationGroups(records, { minGroupSize: parseInt_(body.min, 3, 2, 20) });
+          return sendJson(res, 200, { ok: true, dryRun: true, groups: out.groups });
+        }
+        // 真的要写：必须给出具体组 id，避免"一把梭全并了"
+        const out = findConsolidationGroups(records, { minGroupSize: parseInt_(body.min, 3, 2, 20) });
+        const group = out.groups.find((g) => g.id === body.id);
+        if (!group) return sendJson(res, 404, { ok: false, error: '没找到这个整合组（可能数据变了，重新预览一次）' });
+        const r = applyConsolidation(store, group, { content: body.content });
+        if (!r.ok) return sendJson(res, 400, { ok: false, error: r.error });
+        return sendJson(res, 200, { ok: true, dryRun: false, id: r.id, affected: r.affected, memory: store.get(r.id) });
       }
 
       /* GET /review —— 体检报告（只读） */      if (parts.length === 1 && parts[0] === 'review' && method === 'GET') {

@@ -24,6 +24,7 @@ import { SCHEMA_VERSION, DDL, ENUMS } from './schema.js';
 import { toIndexText } from './text.js';
 import { toMs, toIso } from './time.js';
 import { encodeVec, decodeVec } from './embed.js';
+import { maskPII } from './redact.js';
 
 // ---------------------------------------------------------------- 公共工具
 
@@ -73,17 +74,28 @@ function normalizeTags(tags) {
 /**
  * 把外部输入整理成一条合法记录。缺字段给默认值，非法枚举回退到默认值。
  * 这里**不抛错**：记忆写入宁可落个保守默认值，也不要因为一个字段拼错就丢掉整条记忆。
+ *
+ * **所有写入都必须走这里**，所以脱敏也放在这一层——
+ * 只要有一条路绕过 normalizeRecord，明文密钥就会漏进库里。
+ *
+ * @param {object} input
+ * @param {number} [now]
+ * @param {object} [opts]
+ * @param {boolean} [opts.maskPII=true] 关掉＝我就是要存完整原文（给高级用户留的口子）
  */
-export function normalizeRecord(input, now = Date.now()) {
+export function normalizeRecord(input, now = Date.now(), opts = {}) {
   const createdAt = toMs(input.createdAt) ?? now;
   const updatedAt = toMs(input.updatedAt) ?? now;
+  const maskOn = opts.maskPII !== false;
+  const content = maskPII(String(input.content ?? input.text ?? '').trim(), { enabled: maskOn }).text;
+  const topic = maskPII(String(input.topic ?? '').trim(), { enabled: maskOn }).text;
   return {
     id: input.id ? String(input.id) : newId(now),
     createdAt,
     updatedAt,
     kind: pickEnum(input.kind, ENUMS.kind, 'unknown'),
-    topic: String(input.topic ?? '').trim(),
-    content: String(input.content ?? input.text ?? '').trim(),
+    topic,
+    content,
     importance: pickEnum(input.importance, ENUMS.importance, 'important'),
     status: pickEnum(input.status, ENUMS.status, 'active'),
     project: String(input.project ?? '').trim(),
@@ -104,7 +116,8 @@ export function normalizeRecord(input, now = Date.now()) {
 // ---------------------------------------------------------------- SQLite 后端
 
 class SqliteBackend {
-  constructor(file) {
+  constructor(file, opts = {}) {
+    this.maskPII = opts.maskPII !== false;
     this.backend = 'sqlite';
     this.file = file;
     const DatabaseSync = loadSqlite();
@@ -139,7 +152,11 @@ class SqliteBackend {
   }
 
   put(input) {
-    const rec = normalizeRecord(input);
+    const rawContent = String(input.content ?? input.text ?? '').trim();
+    const rawTopic = String(input.topic ?? '').trim();
+    const rec = normalizeRecord(input, Date.now(), { maskPII: this.maskPII });
+    // 脱敏有没有真的改动内容——UI 和工具要靠它提示"含敏感信息已被脱敏"
+    const masked = rec.content !== rawContent || rec.topic !== rawTopic;
     const existing = this.stByRid ? this.db.prepare('SELECT rid FROM memory WHERE id=?').get(rec.id) : null;
     // 时间列在库里是 TEXT（ISO8601）。若直接绑定毫秒数字，SQLite 的 TEXT 亲和性会把它
     // 写成 "1759200000000.0" 这种字符串，读回来 Date.parse 失败 → 时间被静默当成"现在"。
@@ -161,7 +178,58 @@ class SqliteBackend {
       rid = info.lastInsertRowid;
     }
     this.stFtsInsert.run(rid, ...this._ftsRow(rec));
-    return { id: rec.id, created: !existing, record: rec };
+    return { id: rec.id, created: !existing, record: rec, masked };
+  }
+
+  /**
+   * 给一条记忆追加"后续进展"。
+   *
+   * 为什么不直接改 content：那会丢掉历史。"电脑坏了"改成"电脑好了"，
+   * AI 就不知道"曾经坏过"，也无法解释现在的状态是怎么来的。
+   * 所以走 append-only：原记录不动，进展单独成行，检索时一起带出去。
+   *
+   * @returns {Array|null} 该记忆的全部进展（null = 记忆不存在）
+   */
+  addUpdate(memoryId, { text, status = null, at = Date.now() } = {}) {
+    const id = String(memoryId);
+    const exists = this.db.prepare('SELECT id FROM memory WHERE id=?').get(id);
+    if (!exists) return null;
+    const body = maskPII(String(text ?? '').trim(), { enabled: this.maskPII }).text;
+    if (!body) return null;
+    const iso = toIso(at);
+    this.db.prepare('INSERT INTO memory_update (memory_id, at, text, status) VALUES (?,?,?,?)')
+      .run(id, iso, body, status);
+    // 主记录只动两个地方：updated_at（让它在前排）/ status（若给了新状态）
+    this.db.prepare('UPDATE memory SET updated_at=? WHERE id=?').run(iso, id);
+    if (status) this.db.prepare('UPDATE memory SET status=? WHERE id=?').run(status, id);
+    return this.getUpdates(id);
+  }
+
+  getUpdates(memoryId) {
+    return this.db
+      .prepare('SELECT uid, at, text, status FROM memory_update WHERE memory_id=? ORDER BY at ASC, uid ASC')
+      .all(String(memoryId))
+      .map((r) => ({ id: r.uid, at: r.at, text: r.text, status: r.status ?? null }));
+  }
+
+  /**
+   * 批量取"每条记忆有几条进展"。列表页要显示徽标，但不能为每条记录单独查一次。
+   * @returns {Map<string, number>}
+   */
+  updateCounts(ids) {
+    const out = new Map();
+    const list = (ids ?? []).map(String);
+    if (!list.length) return out;
+    // SQLite 的参数个数有上限，分块查；这里 500 一批足够
+    for (let i = 0; i < list.length; i += 500) {
+      const chunk = list.slice(i, i + 500);
+      const holes = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT memory_id, COUNT(*) AS c FROM memory_update WHERE memory_id IN (${holes}) GROUP BY memory_id`)
+        .all(...chunk);
+      for (const r of rows) out.set(r.memory_id, r.c);
+    }
+    return out;
   }
 
   _toRecord(row) {
@@ -401,13 +469,15 @@ class SqliteBackend {
 // ---------------------------------------------------------------- JSON 后端
 
 class JsonBackend {
-  constructor(file) {
+  constructor(file, opts = {}) {
+    this.maskPII = opts.maskPII !== false;
     this.backend = 'json';
     this.file = file;
     this.records = new Map();
     this.meta = new Map();
     this.cooccur = new Map();
     this.vectors = new Map();
+    this.updates = new Map();
     this.depth = 0;
     this.dirty = false;
     if (fs.existsSync(file)) {
@@ -421,8 +491,10 @@ class JsonBackend {
       this.meta = new Map(Object.entries(data.meta ?? {}));
       for (const [key, v] of Object.entries(data.cooccur ?? {})) this.cooccur.set(key, v);
       for (const [id, v] of Object.entries(data.vectors ?? {})) this.vectors.set(id, v);
+      for (const [id, arr] of Object.entries(data.updates ?? {})) this.updates.set(id, arr);
       for (const r of data.memories ?? []) {
-        const rec = normalizeRecord(r);
+        // 读入时不再脱敏：脱敏是写入时的职责，重复跑会无谓改写历史文本
+        const rec = normalizeRecord(r, undefined, { maskPII: false });
         this.records.set(rec.id, rec);
       }
     }
@@ -437,6 +509,7 @@ class JsonBackend {
       meta: Object.fromEntries(this.meta),
       cooccur: Object.fromEntries(this.cooccur),
       vectors: Object.fromEntries(this.vectors),
+      updates: Object.fromEntries(this.updates),
       memories: [...this.records.values()],
     };
     const tmp = this.file + '.tmp-' + process.pid;
@@ -459,11 +532,45 @@ class JsonBackend {
   }
 
   put(input) {
-    const rec = normalizeRecord(input);
+    const rawContent = String(input.content ?? input.text ?? '').trim();
+    const rawTopic = String(input.topic ?? '').trim();
+    const rec = normalizeRecord(input, Date.now(), { maskPII: this.maskPII });
+    // 脱敏有没有真的改动内容——UI 和工具要靠它提示"含敏感信息已被脱敏"
+    const masked = rec.content !== rawContent || rec.topic !== rawTopic;
     const created = !this.records.has(rec.id);
     this.records.set(rec.id, rec);
     this.flush();
-    return { id: rec.id, created, record: rec };
+    return { id: rec.id, created, record: rec, masked };
+  }
+
+  /** 追加进展（语义与 SQLite 后端一致：原记录不动，进展单独存） */
+  addUpdate(memoryId, { text, status = null, at = Date.now() } = {}) {
+    const id = String(memoryId);
+    const rec = this.records.get(id);
+    if (!rec) return null;
+    const body = maskPII(String(text ?? '').trim(), { enabled: this.maskPII }).text;
+    if (!body) return null;
+    const iso = toIso(at);
+    const arr = this.updates.get(id) ?? [];
+    arr.push({ id: arr.length + 1, at: iso, text: body, status: status ?? null });
+    this.updates.set(id, arr);
+    rec.updatedAt = at;
+    if (status) rec.status = status;
+    this.flush();
+    return this.getUpdates(id);
+  }
+
+  getUpdates(memoryId) {
+    return (this.updates.get(String(memoryId)) ?? []).map((u) => ({ ...u }));
+  }
+
+  updateCounts(ids) {
+    const out = new Map();
+    for (const id of ids ?? []) {
+      const n = (this.updates.get(String(id)) ?? []).length;
+      if (n) out.set(String(id), n);
+    }
+    return out;
   }
 
   get(id) {
@@ -673,7 +780,7 @@ class JsonBackend {
  * @param {string} [opts.home]   DSH_HOME，未给 file 时用默认位置
  * @param {'auto'|'sqlite'|'json'} [opts.backend='auto']
  */
-export function openStore({ file, home, backend = 'auto' } = {}) {
+export function openStore({ file, home, backend = 'auto', maskPII = true } = {}) {
   const base = home || process.env.DSH_HOME || path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
 
   let chosen = backend;
@@ -685,9 +792,9 @@ export function openStore({ file, home, backend = 'auto' } = {}) {
 
   if (chosen === 'sqlite') {
     const target = file || path.join(base, 'dsh-local-memory.db');
-    return new SqliteBackend(target);
+    return new SqliteBackend(target, { maskPII });
   }
 
   const target = file || path.join(base, 'dsh-local-memory.v2.json');
-  return new JsonBackend(target);
+  return new JsonBackend(target, { maskPII });
 }

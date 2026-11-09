@@ -109,12 +109,22 @@ export const HALF_LIFE_DAYS = {
 
 /**
  * 衰减系数 ∈ (0, 1]。刚写的 = 1，过了半个半衰期 ≈ 0.707。
+ *
+ * @param {number|string|Date} when
+ * @param {string} [kind]
+ * @param {number} [now]
+ * @param {object|null} [halfLifeDays] 用户覆盖的每类半衰期（{work:365,...}）。
+ *        没给的类别仍用 HALF_LIFE_DAYS；**给了非法值（0/负数/非数字）也退回默认**，
+ *        因为半衰期是除数，写坏一个 0 就会让整类记忆瞬间消失。
  */
-export function decayFactor(when, kind = 'unknown', now = Date.now()) {
+export function decayFactor(when, kind = 'unknown', now = Date.now(), halfLifeDays = null) {
   const ms = toMs(when);
   if (ms == null) return 0.5; // 时间未知：中性偏保守
   const days = Math.max(0, (now - ms) / DAY_MS);
-  const halfLife = HALF_LIFE_DAYS[kind] ?? HALF_LIFE_DAYS.unknown;
+  const custom = halfLifeDays && Number(halfLifeDays[kind]);
+  const halfLife = (Number.isFinite(custom) && custom > 0)
+    ? custom
+    : (HALF_LIFE_DAYS[kind] ?? HALF_LIFE_DAYS.unknown);
   return Math.pow(0.5, days / halfLife);
 }
 

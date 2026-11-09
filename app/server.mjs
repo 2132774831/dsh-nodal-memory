@@ -19,17 +19,34 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  appHome, defaultDataDir, readState, writeState, clearState,
+  isPidAlive, findLive, startWatchdog,
+  acquireInstanceLock, releaseInstanceLock, waitForState,
+} from './instance.mjs';
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(APP_DIR, '..');
 
 function parseArgs(argv) {
-  const out = { port: 7787, host: '127.0.0.1', data: path.join(APP_DIR, 'data'), seed: null };
+  const out = {
+    port: 7787, host: '127.0.0.1',
+    data: defaultDataDir(),          // 服务的家目录在 DSH 之外，换 Agent 时记忆还在
+    state: appHome(),                // 实例状态文件所在目录
+    seed: null,
+    parentPid: 0,                    // 谁拉起的（插件拉起时传 DSH 的 pid）
+    idleMin: 10,                     // 上游退出/没人用之后多久自动关
+    noLock: false,                   // 跳过单实例检查（测试用）
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port') out.port = Number(argv[++i]);
     else if (a === '--host') out.host = argv[++i];
     else if (a === '--data') out.data = path.resolve(argv[++i]);
+    else if (a === '--state') out.state = path.resolve(argv[++i]);
+    else if (a === '--parent-pid') out.parentPid = Number(argv[++i]) || 0;
+    else if (a === '--idle-min') out.idleMin = Math.max(1, Number(argv[++i]) || 10);
+    else if (a === '--no-lock') out.noLock = true;
     else if (a === '--seed') {
       // `--seed` 后面没跟值（或跟了另一个参数）时用默认路径：
       // 从批处理里传带空格的绝对路径要套两层引号，很容易传坏，这里用哨兵避开。
@@ -113,6 +130,8 @@ export async function startServer(options = {}) {
     // 独立软件没有浏览器的同源/跨站问题：只监听 127.0.0.1，本机才能访问
     get: () => undefined,
     webServer: { register: (spec) => { apiHandler = spec.handler; return () => {}; } },
+    // 告诉路由层"我就是那个界面"，/open 别再去拉起第二个自己
+    isStandaloneApp: true,
   };
   apply(fakeCtx);
   if (!apiHandler) throw new Error('宿主层没有注册 HTTP 路由，无法启动');
@@ -142,6 +161,8 @@ export async function startServer(options = {}) {
   });
 
   async function handle(req, res) {
+    // 任何请求都算"有人在用"，让看门狗重新计时
+    try { opts.touch?.(); } catch { /* 看门狗不许影响请求 */ }
     const url = new URL(req.url, 'http://localhost');
     const pathname = decodeURIComponent(url.pathname);
 
@@ -252,16 +273,103 @@ if (isMain) {
 
   node app/server.mjs [选项]
 
-  --port <数字>   监听端口，默认 7787（被占用会自动往后试）
-  --host <地址>   监听地址，默认 127.0.0.1（只允许本机访问）
-  --data <目录>   数据目录，默认 app/data
-  --seed <文件>   首次启动时把这份 v1 JSON 库复制进来（会自动迁移成 SQLite）
+  --port <数字>     监听端口，默认 7787（0 = 让系统分配；被占用会自动往后试）
+  --host <地址>     监听地址，默认 127.0.0.1（只允许本机访问）
+  --data <目录>     数据目录，默认 $DSH_HOME（Windows 上是 %USERPROFILE%\\.dsh）
+                    —— 和插件共用同一个库 dsh-local-memory.db，别改成别处
+  --state <目录>    实例状态目录，默认 $DSH_HOME\\local-memory
+  --parent-pid <N>  拉起本进程的父进程（DSH）：它消失后闲置到点就自动退出
+  --idle-min <N>    闲置多少分钟后自动退出，默认 10
+  --no-lock         跳过单实例检查（测试用）
+  --seed <文件>     首次启动时把这份 v1 JSON 库复制进来（会自动迁移成 SQLite）
 
-启动后浏览器打开打印出来的地址即可。数据只存在 --data 指向的目录里。`);
+同一个状态目录只会有一个实例：再启动一次会复用已有的，并打印它的地址。`);
     process.exit(0);
   }
 
+  // ── 单实例：桌面快捷方式和插件拉起是同一个入口，靠**原子锁**收敛 ──
+  //
+  // 注意顺序：先抢锁，再谈复用。以前是先读 instance.json 判断有没有在跑，
+  // 但那个文件要等 listen 之后才写，两个同时启动的进程会都看到"没有"，
+  // 于是起两份、各占一个端口（快速双击就能复现）。锁文件是原子创建的，
+  // 抢不到的那个只负责"等对方的端口然后退出"。
+  let lockHeld = false;
+  if (!opts.noLock) {
+    const lock = acquireInstanceLock(opts.state);
+    if (!lock.ok) {
+      // 对方已经抢到锁：等它把端口写出来（它可能还在 listen）
+      const live = await waitForState(opts.state, { timeoutMs: 10000 });
+      console.log('');
+      if (live) {
+        console.log('  已经有一个记忆软件在运行，直接复用它');
+        console.log('  地址：http://' + (live.host || opts.host) + ':' + live.port);
+        if (opts.open) openBrowser('http://' + (live.host || opts.host) + ':' + live.port + '/');
+      } else {
+        console.log('  另一个实例正在启动（PID ' + lock.holder.pid + '），这次不再重复启动');
+      }
+      console.log('');
+      process.exit(0);
+    }
+    lockHeld = true;
+    // 无论怎么退出都要放锁，否则崩溃一次就再也起不来（除非等 PID 被复用）
+    const release = () => { if (lockHeld) releaseInstanceLock(opts.state); };
+    process.on('exit', release);
+    process.on('SIGINT', release);
+    process.on('SIGTERM', release);
+
+    // 锁到手了再补一次"真的活着吗"：持锁进程可能是僵尸（kill -0 能过但已无响应）
+    const live = await findLive(opts.state, { host: opts.host });
+    if (live) {
+      console.log('');
+      console.log('  已经有一个记忆软件在运行，直接复用它');
+      console.log('  地址：http://' + opts.host + ':' + live.port);
+      if (opts.open) openBrowser('http://' + opts.host + ':' + live.port + '/');
+      console.log('');
+      release();
+      lockHeld = false;
+      process.exit(0);
+    }
+  }
+
+  // 一次性迁移：默认数据目录从 `app/data` 换成了 $DSH_HOME（插件和独立软件共用同一个库）。
+  // 老用户第一次用新版本时把已有的库原样搬过去——**不能让升级看起来像"记忆全没了"**。
+  // ⚠ 必须在 startServer 之前搬：库一打开就锁住了，事后再覆盖会写坏。
+  try {
+    const target = path.join(opts.data, 'dsh-local-memory.db');
+    const legacy = path.join(APP_DIR, 'data', 'dsh-local-memory.db');
+    if (!fs.existsSync(target) && fs.existsSync(legacy)) {
+      fs.mkdirSync(opts.data, { recursive: true });
+      for (const suffix of ['', '-wal', '-shm']) {
+        const from = legacy + suffix;
+        if (fs.existsSync(from)) fs.copyFileSync(from, target + suffix);
+      }
+      console.log('');
+      console.log('  已把原有数据库迁移到新位置（只搬一次，之后以新位置为准）：');
+      console.log('    从  ' + legacy);
+      console.log('    到  ' + target);
+      console.log('');
+    }
+  } catch (err) {
+    console.error('[警告] 旧数据库迁移失败（不影响启动，数据仍在原处）：', err && err.message);
+  }
+
   const app = await startServer(opts);
+
+
+  // 把"我在哪"写下来：插件和快捷方式都读这个文件，不猜端口
+  try {
+    writeState(opts.state, {
+      pid: process.pid,
+      port: app.port,
+      host: opts.host,
+      url: app.url,
+      dataDir: app.dataDir,
+      parentPid: opts.parentPid || 0,
+      startedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[警告] 状态文件写不进去，插件可能找不到本实例：', err && err.message);
+  }
   console.log('');
   console.log('  记忆软件已启动');
   console.log('  ─────────────────────────────');
@@ -271,6 +379,27 @@ if (isMain) {
   console.log('');
   console.log('  按 Ctrl+C 停止。数据只写在上面的数据目录里。');
   console.log('');
+
+  let closing = false;
+  const shutdown = async () => {
+    if (closing) return;
+    closing = true;
+    console.log('正在关闭…');
+    try { watchdog.stop(); } catch { /* 已经停了 */ }
+    clearState(opts.state);
+    if (lockHeld) { releaseInstanceLock(opts.state); lockHeld = false; }
+    await app.close();
+    process.exit(0);
+  };
+
+  // 生命周期：DSH 拉起时监视它的存活；没人用了（连续 idleMin 分钟无请求）就自己收掉。
+  // 这样 DSH 退出后不会一直留个进程，用户手动打开时也不会因为"没人关"而常驻。
+  const watchdog = startWatchdog({
+    parentPid: opts.parentPid || 0,
+    idleMs: opts.idleMin * 60 * 1000,
+    onExit: shutdown,
+    log: (msg) => console.log('[生命周期] ' + msg),
+  });
 
   // 常驻服务不能因为一个异步错误就整个退出：记日志，继续服务
   process.on('unhandledRejection', (err) => {
@@ -285,14 +414,6 @@ if (isMain) {
 
   if (opts.open) openBrowser(app.url);
 
-  let closing = false;
-  const shutdown = async () => {
-    if (closing) return;
-    closing = true;
-    console.log('正在关闭…');
-    await app.close();
-    process.exit(0);
-  };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }

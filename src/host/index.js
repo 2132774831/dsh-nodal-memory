@@ -103,7 +103,8 @@ export function apply(ctx) {
       try {
         if (store) store.close();
       } catch { /* 旧库关不掉不影响新库 */ }
-      store = openStore({ file, backend });
+      // 隐私开关跟着配置走：默认开，用户可以显式关掉（"我就是要存完整原文"）
+      store = openStore({ file, backend, maskPII: cfg.privacy?.maskPII !== false });
       storeKey = key;
       autoMigrate(store);
       maybeMaintain(store);
@@ -240,3 +241,14 @@ export function apply(ctx) {
 }
 
 export { NS };
+
+/**
+ * Cordis 只允许插件访问**声明过**的服务。
+ *
+ * ⚠ 这一行是必须的，漏了不会报编译错误，而是运行时报
+ *   `cannot get property "webServer" without inject`
+ *   ——而且如果外面套了 try/catch，就会变成"插件加载成功但工具和路由全没有"。
+ *   v1 一直有这两行，v2 重构时漏掉了，导致插件看起来装上了却什么都不工作。
+ */
+export const name = NS;
+export const inject = ['tools', 'systemPrompt', 'webServer'];

@@ -21,7 +21,7 @@ export { SCHEMA_VERSION, DDL, ENUMS, IMPORTANCE_WEIGHT } from './schema.js';
 
 export { openStore, normalizeRecord, sqliteAvailable } from './store.js';
 
-export { search, renderHits } from './search.js';
+export { search } from './search.js';
 
 export { buildGraph } from './graph.js';
 
@@ -33,8 +33,10 @@ export {
 export { runMaintenance, maintenanceInfo, DEFAULT_INTERVAL_DAYS } from './maintenance.js';
 
 export { findConflicts, reviewCandidates } from './insight.js';
+export { findConsolidationGroups, applyConsolidation } from './consolidate.js';
 
 export { inferKindFromContent, classifyBatch } from './classify.js';
+export { maskPII, REDACT_RULES } from './redact.js';
 
 export {
   createEmbedder, embedderFromConfig, normalizeVec, cosine, encodeVec, decodeVec,

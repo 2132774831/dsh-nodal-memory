@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-memory",
-  "version": "2.0.0",
-  "description": "DeepSeek Harness 纯本地长期记忆 v2：SQLite + 中文二元组检索 + 记忆关系图 + 可选语义检索。数据只存本机，不联网也能用；也能当独立软件双击运行（不需要 DSH）。",
+  "version": "2.5.6",
+  "description": "DeepSeek Harness 纯本地长期记忆：跨对话、跨项目，数据只存本机。默认不联网、不需要 API key；语义检索和关系图可选。附带独立界面（关系图 / 直觉 / 设置），插件只做数据接口和跳转。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -9,37 +9,26 @@
     "memory",
     "local-memory",
     "long-term-memory",
-    "offline",
-    "sqlite",
-    "knowledge-graph"
+    "offline"
   ],
   "type": "module",
   "main": "./src/host/index.js",
   "exports": {
     ".": "./src/host/index.js",
+    "./client": "./src/host/client.js",
     "./core": "./src/core/index.js",
-    "./client": "./src/client/index.js",
     "./package.json": "./package.json"
   },
   "files": [
     "src",
-    "app/server.mjs",
-    "app/ui",
-    "docs",
-    "scripts",
+    "app",
     "cordis.patch.yml",
     "README.md",
-    "INSTALL.md",
-    "CHANGELOG.md",
     "LICENSE"
   ],
-  "scripts": {
-    "app": "node app/server.mjs --open",
-    "verify:install": "node scripts/verify-install.mjs"
-  },
   "license": "MIT",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=20"
   },
   "dsh": {
     "bundle": {

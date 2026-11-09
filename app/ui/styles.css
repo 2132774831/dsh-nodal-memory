@@ -95,11 +95,12 @@ textarea { resize: vertical; }
 .legend .dot { width: 8px; height: 8px; border-radius: 50%; }
 
 .side {
-  width: 300px; flex: 0 0 300px; overflow: auto;
+  /* 详情要把全文显示清楚：300px 太窄，读到一半一直折行很难受 */
+  width: 360px; flex: 0 0 360px; overflow: auto;
   border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
 }
 .side h3 { margin: 0 0 8px; font-size: 13px; }
-.body { white-space: pre-wrap; font-size: 12px; line-height: 1.65; color: #cfd3d8; }
+.body { white-space: pre-wrap; font-size: 12px; line-height: 1.65; color: #cfd3d8; overflow-wrap: anywhere; }
 
 /* ── 列表 ── */
 .scroll { flex: 1 1 auto; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
@@ -146,6 +147,7 @@ textarea { resize: vertical; }
   margin-top: 6px; max-height: 300px; overflow: auto;
   white-space: pre-wrap; font-size: 12px; line-height: 1.65;
   color: #cfd3d8; border-top: 1px solid var(--line); padding-top: 7px;
+  overflow-wrap: anywhere;
 }
 .nodemenu__foot {
   display: flex; align-items: center; justify-content: space-between;

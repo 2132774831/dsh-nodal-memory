@@ -801,6 +801,37 @@ function renderGraph() {
 
   let popupEl = null;
 
+  /**
+   * 详情缓存。
+   *
+   * 为什么需要：关系图上的 node.label 是**画布用的截断文本**（太长会糊成一团），
+   * 直接拿它当详情正文会显示不全。所以点开时再按 id 拉一次全文。
+   * 缓存起来避免同一个节点反复请求。
+   */
+  const detailCache = new Map();
+  function fetchDetail(id) {
+    if (!detailCache.has(id)) {
+      detailCache.set(id, api('/memories/' + encodeURIComponent(id)).catch(() => null));
+    }
+    return detailCache.get(id);
+  }
+
+  /** 把全文 + 后续进展补进已经渲染好的容器里 */
+  function patchDetail(container, detail, bodySelector = '.nodemenu__body') {
+    if (!detail || !detail.memory) return;
+    const body = container.querySelector(bodySelector);
+    if (body) body.textContent = inlineText(detail.memory.content || '');
+    const ups = detail.updates || [];
+    if (ups.length && body) {
+      const last = ups[ups.length - 1];
+      const line = document.createElement('div');
+      line.className = 'hint';
+      line.style.marginTop = '8px';
+      line.textContent = `↳ 后续进展（共 ${ups.length} 条）：${last.text}`;
+      body.after(line);
+    }
+  }
+
   function closePopup() {
     if (popupEl) { popupEl.remove(); popupEl = null; }
   }
@@ -839,13 +870,19 @@ function renderGraph() {
 
     el.querySelector('.nodemenu__x').onclick = closePopup;
     el.querySelector('[data-copy]').onclick = async () => {
+      // 复制的一定是**全文**，不是画布上的截断标签
+      const d = await fetchDetail(node.id);
+      const text = (d && d.memory && d.memory.content) || inlineText(node.label || '');
       try {
-        await navigator.clipboard.writeText(inlineText(node.label || ''));
-        toast('已复制正文');
+        await navigator.clipboard.writeText(text);
+        toast(d && d.memory ? '已复制全文' : '已复制（只有截断文本）');
       } catch {
         toast('复制失败（浏览器不允许）', true);
       }
     };
+
+    // 标签是截断的，先把全文补上再显示
+    fetchDetail(node.id).then((d) => patchDetail(el, d));
 
     popupEl = el;
   }
@@ -901,6 +938,11 @@ function renderGraph() {
       <div class="bar" style="margin-top:10px"><button class="btn" id="gClose">关闭</button></div>`;
     const close = document.getElementById('gClose');
     if (close) close.onclick = () => { selected = null; renderSide(); };
+    // 侧栏里先把截断标签显示出来（立刻有反馈），再补全文
+    fetchDetail(selected.id).then((d) => {
+      if (!selected || d === null) return;
+      patchDetail(side, d, '.body');
+    });
   }
 
   function fitView() {
@@ -1042,6 +1084,14 @@ function renderList() {
       <button class="btn btn--primary" id="lAdd">新增</button>
       <span class="stat" id="lStat"></span>
     </div>
+    <div class="bar" id="lKindBar">
+      <span class="stat">类别：</span>
+      <button class="btn btn--on" data-kind="">全部</button>
+      <button class="btn" data-kind="work">工作</button>
+      <button class="btn" data-kind="emotion">情感</button>
+      <button class="btn" data-kind="preference">偏好</button>
+      <button class="btn" data-kind="unknown">未分类</button>
+    </div>
     <div id="lAddBox"></div>
     <div class="scroll" id="lList"></div>`;
 
@@ -1053,12 +1103,15 @@ function renderList() {
 
   let showDeleted = false;
   let editing = null;
+  // 类别筛选：情感轨要有地方看，否则记了也等于没记
+  let kindFilter = '';
 
   async function load(q) {
     statEl.textContent = '读取中…';
     try {
       const params = new URLSearchParams({ limit: '60' });
       if (q) params.set('q', q);
+      if (kindFilter) params.set('kind', kindFilter);
       if (showDeleted) params.set('includeDeleted', '1');
       const data = await api('/memories?' + params.toString());
       statEl.textContent = `共 ${data.total} 条` + (q ? ` · 命中 ${data.memories.length}` : '');
@@ -1094,11 +1147,12 @@ function renderList() {
                <button class="btn" data-act="cancel">取消</button>
              </div>`
           : `<div class="body">${esc(compact(rec.content, 160))}</div>
+             ${rec.updatesCount ? `<div class="meta" style="margin-top:4px">↳ 有 ${rec.updatesCount} 条后续进展</div>` : ''}
              ${tags ? `<div class="meta" style="margin-top:4px">${tags}</div>` : ''}
              <div class="itemActions">
                ${rec.deletedAt
                  ? '<button class="btn" data-act="restore">恢复</button><button class="btn btn--danger" data-act="purge">彻底删除</button>'
-                 : '<button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>'}
+                 : '<button class="btn" data-act="progress">追加进展</button><button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>'}
              </div>`}
       </div>`;
     }).join('');
@@ -1114,6 +1168,21 @@ function renderList() {
 
     if (act === 'edit') { editing = id; load(queryEl.value); return; }
     if (act === 'cancel') { editing = null; load(queryEl.value); return; }
+    // 追加进展：原记忆不改，只往后加一行"后来怎么样了"
+    if (act === 'progress') {
+      const text = prompt('这条记忆后来怎么样了？（不会覆盖原文，会追加在后面）');
+      if (text == null) return;
+      if (!text.trim()) { toast('内容为空，没保存', true); return; }
+      try {
+        await api('/memories/' + encodeURIComponent(id) + '/updates', {
+          method: 'POST',
+          body: JSON.stringify({ text }),
+        });
+        toast('已追加进展');
+        await load(queryEl.value);
+      } catch (err) { toast('追加失败：' + err.message, true); }
+      return;
+    }
     if (act === 'save') {
       const ta = item.querySelector('textarea[data-edit]');
       try {
@@ -1137,6 +1206,15 @@ function renderList() {
   });
 
   document.getElementById('lSearch').addEventListener('click', () => load(queryEl.value));
+  document.getElementById('lKindBar').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-kind]');
+    if (!btn) return;
+    kindFilter = btn.dataset.kind || '';
+    for (const b of document.querySelectorAll('#lKindBar button[data-kind]')) {
+      b.classList.toggle('btn--on', (b.dataset.kind || '') === kindFilter);
+    }
+    load(queryEl.value);
+  });
   queryEl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') load(queryEl.value); });
   document.getElementById('lAll').addEventListener('click', () => { queryEl.value = ''; load(''); });
   deletedBtn.addEventListener('click', () => {
@@ -1204,10 +1282,12 @@ function renderClassify() {
       <span class="stat" id="cStat">读取中…</span>
       <button class="btn" id="cAll">只看未分类：开</button>
       <button class="btn" id="cAuto" title="按内容把未分类的粗分成 工作/偏好/情感，先预览再执行">自动分类</button>
+      <button class="btn" id="cConsolidate" title="把同一件事反复出现的几条合成一条高阶结论（原文保留，先预览）">归纳候选</button>
       <button class="btn" id="cReload">刷新</button>
     </div>
     <div class="hint">逐条读正文再归位。分类只影响<b>半衰期</b>（工作 365 天 / 偏好 730 天 / 情感 60 天）和图的着色，写错了随时改，不丢记忆。</div>
     <div id="cAutoBox"></div>
+    <div id="cConsBox"></div>
     <div class="scroll" id="cList"></div>`;
 
   const listEl = document.getElementById('cList');
@@ -1306,6 +1386,57 @@ function renderClassify() {
    * 自动分类：**先预览再执行**。
    * 分类会改半衰期（一条工作记忆被误判成情感，60 天就衰减掉了），所以不能一键静默改完。
    */
+  document.getElementById('cConsolidate').addEventListener('click', async () => {
+    const box = document.getElementById('cConsBox');
+    box.innerHTML = '<div class="hint">正在找同一件事的多条记录…</div>';
+    try {
+      const data = await api('/consolidate');
+      if (!data.groups.length) {
+        box.innerHTML = '<div class="hint">没有找到需要归纳的组（同一件事至少出现 3 次才会入选）。</div>';
+        return;
+      }
+      box.innerHTML = `
+        <div class="item">
+          <div class="itemHead">
+            <strong>归纳候选（${data.groups.length} 组）</strong>
+            <span class="hint">原文一条都不会删；整合后碎片退出自动回忆，但还能搜到</span>
+          </div>
+          ${data.groups.slice(0, 20).map((g) => `
+            <div class="item" style="margin-top:8px">
+              <div class="meta">
+                <span class="tag">${esc(g.by === 'similar' ? '同一件事' : '同一话题')}</span>
+                <span class="tag">${esc(g.tag)}</span>
+                <span class="tag">${g.size} 条</span>
+                ${g.spanDays ? `<span class="tag">跨度 ${g.spanDays} 天</span>` : ''}
+              </div>
+              <div class="body" style="margin-top:6px">${esc(g.suggestedContent)}</div>
+              <div class="itemActions">
+                <button class="btn btn--primary" data-cons="${esc(g.id)}">应用这组</button>
+              </div>
+            </div>`).join('')}
+        </div>`;
+
+      for (const btn of box.querySelectorAll('[data-cons]')) {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-cons');
+          btn.disabled = true;
+          try {
+            const r = await api('/consolidate', { method: 'POST', body: JSON.stringify({ dryRun: false, id }) });
+            toast(`已归纳：影响 ${r.affected} 条原文`);
+            box.innerHTML = '';
+            await load();
+            await refreshMeta();
+          } catch (err) {
+            btn.disabled = false;
+            toast('归纳失败：' + err.message, true);
+          }
+        });
+      }
+    } catch (err) {
+      box.innerHTML = `<div class="err">读取失败：${esc(err.message)}</div>`;
+    }
+  });
+
   document.getElementById('cAuto').addEventListener('click', async () => {
     autoBox.innerHTML = '<div class="hint">分析中…</div>';
     try {
@@ -1541,6 +1672,42 @@ function renderSettings() {
       </div>
 
       <div class="item">
+        <div class="itemHead">
+          <strong>衰减速度（半衰期）</strong>
+          <span class="hint">数字＝多少天后"相关度"掉一半。只影响排序，永不删数据</span>
+        </div>
+        <div class="hint" style="margin:6px 0">
+          想让某类记忆留得更久就调大，想让它快点沉下去就调小。范围 7 ~ 3650 天。
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:8px">
+          <label class="row" style="gap:6px">
+            <span class="label">工作</span>
+            <input class="input" type="number" id="hlWork" min="7" max="3650" step="1" style="width:90px" />
+            <span class="hint">天</span>
+          </label>
+          <label class="row" style="gap:6px">
+            <span class="label">偏好</span>
+            <input class="input" type="number" id="hlPreference" min="7" max="3650" step="1" style="width:90px" />
+            <span class="hint">天</span>
+          </label>
+          <label class="row" style="gap:6px">
+            <span class="label">情感</span>
+            <input class="input" type="number" id="hlEmotion" min="7" max="3650" step="1" style="width:90px" />
+            <span class="hint">天</span>
+          </label>
+          <label class="row" style="gap:6px">
+            <span class="label">未分类</span>
+            <input class="input" type="number" id="hlUnknown" min="7" max="3650" step="1" style="width:90px" />
+            <span class="hint">天</span>
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="hint" id="hlHint"></span>
+          <button class="btn btn--primary" id="hlSave" style="margin-left:auto">保存衰减设置</button>
+        </div>
+      </div>
+
+      <div class="item">
         <div class="itemHead"><strong>维护</strong><span class="hint" id="mInfo"></span></div>
         <div class="hint" style="margin:6px 0">
           维护只做安全的事：清掉指向已删除记忆的孤儿关系、记一份统计快照。
@@ -1569,6 +1736,29 @@ function renderSettings() {
 
   const $ = (id) => document.getElementById(id);
 
+  /** 衰减速度保存：四个数字一起提交，后端会夹到 7~3650 */
+  $('hlSave').addEventListener('click', async () => {
+    const read = (id, fallback) => {
+      const n = Number($(id).value);
+      return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+    };
+    try {
+      await api('/config', {
+        method: 'POST',
+        body: JSON.stringify({
+          halfLifeDays: {
+            work: read('hlWork', 365),
+            preference: read('hlPreference', 730),
+            emotion: read('hlEmotion', 60),
+            unknown: read('hlUnknown', 365),
+          },
+        }),
+      });
+      toast('衰减设置已保存');
+      await refreshMeta();
+    } catch (err) { toast('保存失败：' + err.message, true); }
+  });
+
   /**
    * 功能开关清单。文案里写清"关了会失去什么"，因为开关本身不该需要猜。
    * 顺序按"最有用的在前"排。
@@ -1580,6 +1770,8 @@ function renderSettings() {
     ['dueReview', '该想起的', '直觉页列出重要、搁得久、几乎没用过的记忆'],
     ['projectEdges', '同项目边（弱）', '只说明"同一摊事"。59 条同项目曾连出 1711 条边的毛线球，默认关'],
     ['timeEdges', '时间相邻边', '本身信息量很低，但它是把记忆按时间串开的力——关掉后布局会塌成一团'],
+    ['softForget', '软遗忘（降权不删）', '长期没用过的低价值记忆会往后排，但一条都不会删；关掉＝纯按相关度和时间排'],
+    ['autoKind', '写入时自动分类', '按内容粗分工作/偏好/情感，决定衰减速度；误判可以到补标页改'],
   ];
 
   function renderFeatures(feat) {
@@ -1637,6 +1829,13 @@ function renderSettings() {
 
     $('mDays').value = String(s.config.maintenanceIntervalDays || 7);
     renderFeatures(s.config.features || {});
+    // 衰减速度：把当前值填进输入框
+    const hl = s.config.halfLifeDays || {};
+    $('hlWork').value = String(hl.work ?? 365);
+    $('hlPreference').value = String(hl.preference ?? 730);
+    $('hlEmotion').value = String(hl.emotion ?? 60);
+    $('hlUnknown').value = String(hl.unknown ?? 365);
+    $('hlHint').textContent = `情感 ${hl.emotion ?? 60} 天半衰 ＝ 两个月后相关度剩一半；改完只影响排序`;
     $('fSens').value = s.config.conflictSensitivity || 'normal';
     $('mInfo').textContent = s.maintenance && s.maintenance.lastAt
       ? `上次 ${new Date(s.maintenance.lastAt).toLocaleString()}`
