@@ -23,8 +23,95 @@ import { getEmbedder, backfillVectors, queryVectorFor } from './embedding.js';
 import { reviewStore } from './tools.js';
 import { ensureAppRunning } from './app-link.js';
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 export const ROUTE_BASE = '/' + NS;
 const MAX_BODY = 512 * 1024;
+
+/* ────────────────── 内置界面（插件自己把 UI 吐出来） ──────────────────
+ *
+ * 以前"打开完整记忆界面"要拉起一个独立 Node 进程（127.0.0.1:7787），
+ * 那个进程带来了一连串麻烦：安装包、控制台黑窗、桌面快捷方式、单实例锁、端口冲突。
+ *
+ * 界面本来只是几个静态文件，API 也已经在插件里了，所以直接由插件的 HTTP 处理器
+ * 把它们吐出去即可——同源、同进程、同一份数据。独立软件仍然保留（同一份代码），
+ * 给不用 DSH 的人用。
+ */
+const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const UI_DIR = path.join(PKG_ROOT, 'app', 'ui');
+const CORE_DIR = path.join(PKG_ROOT, 'src', 'core');
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/json; charset=utf-8',
+};
+
+/** 把相对路径安全地拼到 base 下，挡住 ../ 穿越。 */
+function safeJoin(base, rel) {
+  const full = path.resolve(base, rel);
+  const rootWithSep = base.endsWith(path.sep) ? base : base + path.sep;
+  if (full !== base && !full.startsWith(rootWithSep)) return null;
+  return full;
+}
+
+function serveStatic(res, file) {
+  if (!file) { res.writeHead(400); res.end('bad path'); return; }
+  let data;
+  try {
+    data = fs.readFileSync(file);
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+    // 界面改动不频繁，允许短缓存；带 no-cache 让刷新立刻生效
+    'Cache-Control': 'no-cache',
+    'Content-Length': String(data.length),
+  });
+  res.end(data);
+}
+
+/**
+ * 处理内置界面的静态文件。**必须在信任栅栏之前调用**：
+ *   - 这些文件不含任何用户数据，放行没有安全损失（数据接口仍然全在栅栏后面）
+ *   - 从设置页跳到 /ui/ 是一次普通页面导航，不带 Origin 头，
+ *     过栅栏有被误判的风险（表现就是"点开一片空白或 401"）
+ * 返回 true 表示已经处理完（调用方直接 return）。
+ */
+function handleUiRequest(res, url, method) {
+  const pathname = url.pathname;
+  const base = ROUTE_BASE + '/ui';
+  if (pathname !== base && !pathname.startsWith(base + '/')) return false;
+  if (method !== 'GET' && method !== 'HEAD') {
+    res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('method not allowed');
+    return true;
+  }
+  if (pathname === base) {
+    res.writeHead(302, { Location: base + '/', 'Cache-Control': 'no-store' });
+    res.end();
+    return true;
+  }
+  const rest = pathname.slice(base.length + 1);
+  if (rest === '' || rest === 'index.html') { serveStatic(res, path.join(UI_DIR, 'index.html')); return true; }
+  if (rest === 'app.js' || rest === 'styles.css') { serveStatic(res, safeJoin(UI_DIR, rest)); return true; }
+  if (rest.startsWith('core/')) { serveStatic(res, safeJoin(CORE_DIR, rest.slice('core/'.length))); return true; }
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('not found');
+  return true;
+}
+/** 内置界面是否可用（打包漏了文件时不要假装能打开）。 */
+export function uiAvailable() {
+  try { return fs.existsSync(path.join(UI_DIR, 'index.html')); } catch { return false; }
+}
 
 function sendJson(res, code, payload) {
   const body = Buffer.from(JSON.stringify(payload), 'utf8');
@@ -152,6 +239,12 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
   }
 
   async function handler(req, res) {
+    // 内置界面先于信任栅栏处理（见 handleUiRequest 的注释）
+    try {
+      const uiUrl = new URL(req.url, 'http://localhost');
+      if (handleUiRequest(res, uiUrl, req.method)) return;
+    } catch { /* 畸形 URL 交给下面的 400 分支 */ }
+
     if (rejected(req, res)) return;
 
     let url;
@@ -167,13 +260,25 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
     const method = (req.method || 'GET').toUpperCase();
     const query = Object.fromEntries(url.searchParams.entries());
 
+    /* GET /ui/... —— 内置界面（插件自己吐静态文件，不拉独立进程）
+     *    /ui            → 302 到 /ui/（必须带尾斜杠，否则 ./app.js 会解析错）
+     *    /ui/           → index.html
+     *    /ui/app.js     → app/ui/app.js
+     *    /ui/styles.css → app/ui/styles.css
+     *    /ui/core/x.js  → src/core/x.js（关系图布局直接用同一份内核代码）
+     */
     /* GET /open —— 打开完整记忆界面。
-     * 没在跑就先拉起来（用 DSH 自带的 Node，用户不需要装 Node），再 302 跳过去。
-     * 关系图/卡片视图/直觉/设置都在那个界面里，插件这边不重画。 */
+     * 优先用插件内置的界面（同进程、同源、无额外进程）；
+     * 只有在界面文件缺失时，才退回到"拉起独立软件"的老路子。 */
     if (parts.length === 1 && parts[0] === 'open' && method === 'GET') {
       // 独立软件自己就是那个界面：直接回根路径，别去拉起第二个自己
       if (ctx && ctx.isStandaloneApp) {
         res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      if (uiAvailable()) {
+        res.writeHead(302, { Location: ROUTE_BASE + '/ui/', 'Cache-Control': 'no-store' });
         res.end();
         return;
       }

@@ -471,7 +471,8 @@ window.__ModuleLoader__.load({
     function Panel() {
       const [tab, setTab] = useState('list');
       const openApp = () => {
-        // 走宿主自己的 /open：它会确保独立应用在跑，再 302 过去
+        // 走宿主自己的 /open：优先打开插件内置的界面（/ui/，同进程无额外进程）；
+      // 只有在内置界面文件缺失时，才退回"拉起独立软件"的老路子
         window.open(API + '/open', '_blank', 'noopener');
       };
       return h('div', { className: '__lm2_root' },

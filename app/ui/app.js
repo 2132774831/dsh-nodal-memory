@@ -1,14 +1,14 @@
 /**
  * 独立版记忆软件 · 界面（原生 DOM，零依赖，无构建）
  *
- * 关系图布局直接从 /core/graph-layout.js 以 ESM 引入——和单元测试用的是同一份代码。
+ * 关系图布局从 ./core/graph-layout.js 以 ESM 引入（相对路径：插件和独立软件两种挂载都能用）——和单元测试用的是同一份代码。
  * 数据全部走本机 HTTP 接口（/dsh-local-memory/*），没有别的通道。
  */
 
 import {
   createLayout, stepLayout, isSettled, bounds,
   kindColor, edgeStyle, KIND_COLORS, EDGE_STYLES,
-} from '/core/graph-layout.js';
+} from './core/graph-layout.js';
 
 const API = '/dsh-local-memory';
 

@@ -427,3 +427,61 @@ test('保存的 apiKey 绝不经接口回显（只回 hasStoredKey）', async ()
   assert.equal(state.json.config.embedding.apiKey, '');
   assert.ok(!state.body.includes(secret), '/state 也不能出现明文');
 });
+
+/* ─────────── 内置界面（插件自己吐 UI，不再拉独立进程） ───────────
+ * 以前"打开完整记忆界面"要 spawn 一个 node 进程，带来安装包/黑窗/快捷方式/
+ * 单实例/端口一整套麻烦。界面本来只是静态文件，插件直接吐出去就行。
+ * 这里盯住三件事：路径对、相对资源能取到、不许路径穿越。 */
+
+test('内置界面：/ui 带尾斜杠跳转（否则 ./app.js 会解析到错误目录）', async () => {
+  const { holder } = mount();
+  const r = await request(holder, { sub: '/ui' });
+  assert.equal(r.code, 302);
+  assert.ok(String(r.headers.Location).endsWith('/ui/'), '应跳到 /ui/');
+});
+
+test('内置界面：/ui/ 返回 HTML，/open 也指向它', async () => {
+  const { holder } = mount();
+  const page = await request(holder, { sub: '/ui/' });
+  assert.equal(page.code, 200);
+  assert.match(page.headers['Content-Type'], /text\/html/);
+  assert.match(page.body, /本地记忆/);
+
+  const open = await request(holder, { sub: '/open' });
+  assert.equal(open.code, 302);
+  assert.ok(String(open.headers.Location).includes('/ui/'), '/open 应跳到内置界面');
+});
+
+test('内置界面：静态资源与内核模块都能取到', async () => {
+  const { holder } = mount();
+  for (const [sub, type] of [
+    ['/ui/app.js', /javascript/],
+    ['/ui/styles.css', /text\/css/],
+    ['/ui/core/graph-layout.js', /javascript/],
+  ]) {
+    const r = await request(holder, { sub });
+    assert.equal(r.code, 200, sub + ' 应返回 200');
+    assert.match(r.headers['Content-Type'], type, sub + ' 的 Content-Type 不对');
+    assert.ok(r.body.length > 100, sub + ' 内容太短，可能是空文件');
+  }
+});
+
+test('内置界面：不许路径穿越（编码过的 ../ 必须挡住）', async () => {
+  const { holder } = mount();
+  // 说明：明文 ../ 会被 URL 规范化掉（变成别的合法路由），真正危险的是 %2f 编码的，
+  // 它到达处理器时仍是 ../ —— 这类必须靠 safeJoin 拦，返回 404 且不能吐出文件内容。
+  const probes = [
+    '/ui/core/..%2f..%2f..%2fpackage.json',
+    '/ui/core/..%2f..%2fhost%2fconfig.js',
+    '/ui/..%2fserver.mjs',
+  ];
+  for (const sub of probes) {
+    const r = await request(holder, { sub });
+    assert.equal(r.code, 404, sub + ' 应该 404');
+    assert.ok(!/dsh-local-memory"\s*,/.test(r.body), sub + ' 疑似吐出了 package.json 内容');
+    assert.ok(!r.body.includes('export'), sub + ' 疑似吐出了源码');
+  }
+  // 正常文件名不存在时也应该 404，而不是抛 500
+  const miss = await request(holder, { sub: '/ui/nope.js' });
+  assert.equal(miss.code, 404);
+});
