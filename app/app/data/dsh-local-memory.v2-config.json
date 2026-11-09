@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "backend": "auto",
+  "autoRecall": true,
+  "autoRecallMaxItems": 5,
+  "autoRecallMinChars": 8,
+  "autoTagProject": true,
+  "maxTextLength": 4000,
+  "reviewIntervalDays": 30,
+  "lastReviewAt": 0,
+  "maintenanceIntervalDays": 7,
+  "injectBrief": true,
+  "embedding": {
+    "enabled": true,
+    "baseUrl": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+    "model": "qwen3.7-text-embedding-flash",
+    "apiKeyEnv": "DSH_EMBEDDING_API_KEY",
+    "apiKey": "sk-ws-H.YELLELD.lkbu.MEYCIQDs47qUIk36HdxruPLbsl7CjSK2oXq5i9QrzEGQvw3-4gIhAPFolmo3YUDiS4KU0CilMlOddUBWEXZn6YwvJt1hmCc4"
+  },
+  "features": {
+    "semanticEdges": true,
+    "conflictMarks": true,
+    "projectEdges": false,
+    "timeEdges": true,
+    "dueReview": true,
+    "conflictScan": true
+  },
+  "conflictSensitivity": "normal"
+}
