@@ -38,21 +38,31 @@ async function checkAsync(name, fn) {
   }
 }
 
-const entryRel = pkg.exports && pkg.exports['./v2'];
-const clientRel = pkg.exports && pkg.exports['./v2/client'];
+/**
+ * 入口解析要**兼容两种布局**，而且优先级不能反：
+ *   - 开发工作区：主入口 '.' 仍是 v1 的 lib/，v2 在 exports['./v2'] → **必须优先用 ./v2**
+ *   - 发布包：v2 就是正式入口，exports['.'] 指向 src/host/index.js，没有 ./v2 → 退回 '.'
+ *
+ * 这个脚本是"v2 装机彩排"，所以永远优先测 v2。
+ * （踩过的坑：先写的版本优先取 '.'，结果在工作区里彩排跑的是 v1，报 /graph 404。）
+ */
+const entryRel = (pkg.exports && (pkg.exports['./v2'] || pkg.exports['.'])) || pkg.main;
+const clientRel = (pkg.exports && (pkg.exports['./v2/client'] || pkg.exports['./client']))
+  || './src/client/index.js';
 
 /* ── 1. 入口声明可解析 ── */
-check('package.json 声明了 ./v2 入口', () => {
-  if (!entryRel) throw new Error('exports["./v2"] 缺失');
+check('package.json 声明了可解析的入口', () => {
+  if (!entryRel) throw new Error('exports["."] / exports["./v2"] / main 都没有');
   return entryRel;
 });
-check('./v2 入口文件存在', () => {
+check('入口文件存在', () => {
   const p = path.join(ROOT, entryRel.replace(/^\.\//, ''));
   if (!fs.existsSync(p)) throw new Error('文件不存在：' + p);
   return path.relative(ROOT, p);
 });
 check('前端入口存在且是 ModuleLoader bundle', () => {
   const p = path.join(ROOT, clientRel.replace(/^\.\//, ''));
+  if (!fs.existsSync(p)) throw new Error('前端入口不存在：' + p);
   const src = fs.readFileSync(p, 'utf8');
   if (!src.includes('__ModuleLoader__.load(')) throw new Error('不是 ModuleLoader bundle');
   return path.relative(ROOT, p);

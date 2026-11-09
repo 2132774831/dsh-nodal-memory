@@ -126,7 +126,7 @@ async function refreshMeta() {
 function renderGraph() {
   view.innerHTML = `
     <div class="bar">
-      <input type="search" id="gFilter" placeholder="高亮包含…（正文或标签）" style="width:200px" />
+      <input type="search" id="gFilter" placeholder="高亮包含…（正文或标签）" style="width:200px" maxlength="100" />
       <button class="btn" id="gMode" title="在「圆点图」和「工作流卡片图」之间切换">视图：圆点</button>
       <button class="btn btn--on" id="gSem" title="语义连线需要 embedding；关掉就不再为图查询花向量调用">语义：开</button>
       <button class="btn" id="gIsolated">孤岛视图：关</button>
@@ -1035,7 +1035,7 @@ function renderGraph() {
 function renderList() {
   view.innerHTML = `
     <div class="bar">
-      <input type="search" id="lQuery" placeholder="搜索记忆（中文二字也会命中）" style="width:260px" />
+      <input type="search" id="lQuery" placeholder="搜索记忆（中文二字也会命中）" style="width:260px" maxlength="200" />
       <button class="btn" id="lSearch">搜索</button>
       <button class="btn" id="lAll">显示全部</button>
       <button class="btn" id="lDeleted">含已删：关</button>

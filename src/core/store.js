@@ -52,12 +52,20 @@ function pickEnum(value, allowed, fallback) {
   return allowed.includes(value) ? value : fallback;
 }
 
+/**
+ * 标签清洗：去空、去重、**限个数、限长度**。
+ * 为什么要限：对抗性测试里塞 2000 个标签会原样入库，
+ * 一条记忆就能把库撑大、把关系图的标签边算到卡死。正常使用几十个足够。
+ */
+const MAX_TAGS = 50;
+const MAX_TAG_LEN = 64;
 function normalizeTags(tags) {
   if (!Array.isArray(tags)) return [];
   const out = [];
   for (const t of tags) {
-    const s = String(t ?? '').trim();
+    const s = String(t ?? '').trim().slice(0, MAX_TAG_LEN);
     if (s && !out.includes(s)) out.push(s);
+    if (out.length >= MAX_TAGS) break;
   }
   return out;
 }

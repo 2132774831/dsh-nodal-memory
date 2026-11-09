@@ -297,9 +297,16 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
         return sendJson(res, 200, { ok: true, id: out.id, created: out.created, kindWhy, memory: out.record });
       }
 
-      /* /memories/:id —— 更新 / 软删；/memories/:id/restore|purge —— 恢复 / 彻底删 */
+      /* /memories/:id —— 读 / 更新 / 软删；/memories/:id/restore|purge —— 恢复 / 彻底删 */
       if (parts[0] === 'memories' && parts.length >= 2) {
         const id = parts[1];
+
+        // 单条读取：REST 的标准动作，也让"从别处拿到 id 想看一眼"有地方可去
+        if (parts.length === 2 && method === 'GET') {
+          const rec = store.get(id);
+          if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
+          return sendJson(res, 200, { ok: true, memory: rec });
+        }
 
         if (parts.length === 3) {
           const action = parts[2];
@@ -476,7 +483,9 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
       }
 
       /* GET /export —— 导出 Markdown */
-      if (parts.length === 1 && parts[0] === 'export' && method === 'GET') {
+      if (parts.length === 1 && parts[0] === 'export') {
+        // 路径对但方法不对，要给 405 而不是一路掉到 404——否则排查时容易以为"没这个接口"
+        if (method !== 'GET') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
         let records = store.list({ limit: 100000 });
         if (query.q) {
           records = search(store, query.q, { limit: 100000 }).map((h) => h.record);

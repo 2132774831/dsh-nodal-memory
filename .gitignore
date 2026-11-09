@@ -17,3 +17,15 @@ app/data/
 Thumbs.db
 .idea/
 .vscode/
+
+dist/
+
+
+# 防御：任何层级的 data 目录（含误操作产生的套娃）都不进版本库
+**/data/
+*.db
+*.db-wal
+*.db-shm
+*config*.json
+*.tgz
+
