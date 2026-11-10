@@ -22,6 +22,7 @@ import { findConsolidationGroups, applyConsolidation } from '../core/consolidate
 import { getEmbedder, backfillVectors, queryVectorFor } from './embedding.js';
 import { reviewStore } from './tools.js';
 import { ensureAppRunning } from './app-link.js';
+import { execFile } from 'node:child_process';
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -77,6 +78,178 @@ function serveStatic(res, file) {
     'Content-Length': String(data.length),
   });
   res.end(data);
+}
+
+// ── 开机自启动 ──
+// 用 Windows 启动文件夹放一个 .lnk，而不是写注册表：
+// 用户能自己看见、自己删，出问题不会留下一堆看不懂的注册表项。
+function startupLinkPath() {
+  const appData = process.env.APPDATA || '';
+  if (!appData) return null;
+  return path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', '本地记忆.lnk');
+}
+
+/** 独立软件的 exe 在哪：包根目录下的 LocalMemory.exe（插件模式下可能不存在） */
+function appExePath() {
+  const exe = path.resolve(PKG_ROOT, 'LocalMemory.exe');
+  return fs.existsSync(exe) ? exe : null;
+}
+
+export function autostartStatus() {
+  const link = startupLinkPath();
+  if (!link) return { supported: false, enabled: false, reason: '非 Windows 或拿不到 APPDATA' };
+  return {
+    supported: true,
+    enabled: fs.existsSync(link),
+    link,
+    exe: appExePath(),
+  };
+}
+
+function setAutostart(enabled) {
+  const link = startupLinkPath();
+  if (!link) throw new Error('当前系统不支持开机自启动');
+  if (!enabled) {
+    try { fs.unlinkSync(link); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    return autostartStatus();
+  }
+  const exe = appExePath();
+  if (!exe) throw new Error('找不到 LocalMemory.exe（这个安装没有独立软件组件）');
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  // 用 PowerShell 建快捷方式：Node 没有标准的 .lnk 写入能力
+  const ps = [
+    "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + JSON.stringify(link) + ");",
+    "$s.TargetPath = " + JSON.stringify(exe) + ";",
+    "$s.WorkingDirectory = " + JSON.stringify(path.dirname(exe)) + ";",
+    "$s.Description = '本地记忆（开机自启动）';",
+    "$s.Save();",
+  ].join(' ');
+  return new Promise((resolve, reject) => {
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+      { timeout: 20000, windowsHide: true }, (err) => {
+        if (err) reject(new Error('创建快捷方式失败：' + err.message));
+        else resolve(autostartStatus());
+      });
+  });
+}
+
+// ── 一键装插件（不需要 dsh 命令行：直接写文件 + profile） ──
+const PLUGIN_SPEC = 'github:2132774831/dsh-nodal-memory';
+const PLUGIN_DIR_NAME = 'dsh-local-memory';
+
+function dshHome() {
+  return process.env.DSH_HOME || path.join(process.env.USERPROFILE || process.env.HOME || '', '.dsh');
+}
+
+/** 找当前 profile：优先 desktop，其次第一个 */
+function profileDir() {
+  const root = path.join(dshHome(), 'profiles');
+  try {
+    const dirs = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    if (dirs.includes('desktop')) return path.join(root, 'desktop');
+    return dirs.length ? path.join(root, dirs[0]) : null;
+  } catch { return null; }
+}
+
+function installStatus() {
+  const home = dshHome();
+  const target = path.join(home, 'plugins', PLUGIN_DIR_NAME);
+  const prof = profileDir();
+  const pkgFile = prof ? path.join(prof, 'package.json') : null;
+  let linked = false;
+  let bundled = false;
+  if (pkgFile && fs.existsSync(pkgFile)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+      linked = !!pkg.dependencies && String(pkg.dependencies[PLUGIN_DIR_NAME] || '').startsWith('link:');
+      bundled = !!(pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
+        && pkg.dsh.profile.bundles.includes(PLUGIN_DIR_NAME));
+    } catch { /* 坏 JSON 当没装 */ }
+  }
+  return {
+    installed: fs.existsSync(path.join(target, 'package.json')),
+    linked,
+    bundled,
+    pluginDir: target,
+    profile: prof,
+    cli: findDshCli(),
+    command: 'dsh plugin --profile desktop add ' + PLUGIN_SPEC,
+  };
+}
+
+function findDshCli() {
+  const cands = [
+    process.env.DSH_CLI,
+    path.join(process.env.APPDATA || '', 'npm', 'dsh.cmd'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness', 'dsh.cmd'),
+  ].filter(Boolean);
+  for (const c of cands) { try { if (c && fs.existsSync(c)) return c; } catch { /* ignore */ } }
+  return null;
+}
+
+/** 把本包复制到 ~/.dsh/plugins/<name>，再把它挂进 profile */
+function installIntoDsh() {
+  const home = dshHome();
+  const target = path.join(home, 'plugins', PLUGIN_DIR_NAME);
+  const prof = profileDir();
+  if (!prof) return { ok: false, error: '没找到 DSH profile（' + path.join(home, 'profiles') + '）' };
+
+  const changes = [];
+  try {
+    // 1) 复制包（先删旧目录，避免残留旧文件）
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.mkdirSync(target, { recursive: true });
+    fs.cpSync(PKG_ROOT, target, {
+      recursive: true,
+      filter: (s) => !/[\\/](node_modules|\.git)([\\/]|$)/.test(s),
+    });
+    changes.push('已复制插件文件到 ' + target);
+
+    // 2) 挂进 profile（改之前备份）
+    const pkgFile = path.join(prof, 'package.json');
+    const raw = fs.readFileSync(pkgFile, 'utf8');
+    const pkg = JSON.parse(raw);
+    fs.writeFileSync(pkgFile + '.lm-bak', raw, 'utf8');
+
+    pkg.dependencies = pkg.dependencies || {};
+    const linkSpec = 'link:' + target.replace(/\\/g, '/');
+    if (pkg.dependencies[PLUGIN_DIR_NAME] !== linkSpec) {
+      pkg.dependencies[PLUGIN_DIR_NAME] = linkSpec;
+      changes.push('已在 profile 依赖里挂上 link:' + target);
+    }
+    pkg.dsh = pkg.dsh || {};
+    pkg.dsh.profile = pkg.dsh.profile || {};
+    const bundles = Array.isArray(pkg.dsh.profile.bundles) ? pkg.dsh.profile.bundles : [];
+    if (!bundles.includes(PLUGIN_DIR_NAME)) {
+      bundles.push(PLUGIN_DIR_NAME);
+      pkg.dsh.profile.bundles = bundles;
+      changes.push('已把 ' + PLUGIN_DIR_NAME + ' 加进 bundles');
+    }
+    fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    return { ok: true, changes, needsRestart: true, profile: prof, pluginDir: target };
+  } catch (e) {
+    return { ok: false, error: e.message, changes };
+  }
+}
+
+// ── 导出 MCP ──
+function mcpBundle() {
+  const serverPath = path.join(PKG_ROOT, 'app', 'mcp-server.mjs');
+  const exists = fs.existsSync(serverPath);
+  const nodeExe = process.execPath;
+  return {
+    ok: exists,
+    path: serverPath,
+    source: exists ? fs.readFileSync(serverPath, 'utf8') : '',
+    // 给 Kun / Claude Desktop / Cline 这类客户端直接粘的配置
+    config: {
+      command: nodeExe,
+      args: [serverPath],
+      env: {},
+    },
+    hint: '把上面这段 command/args 填进你用的 agent 的 MCP 配置里（各家的键名可能不同）。',
+  };
 }
 
 /**
@@ -267,6 +440,38 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
      *    /ui/styles.css → app/ui/styles.css
      *    /ui/core/x.js  → src/core/x.js（关系图布局直接用同一份内核代码）
      */
+    /* ── 开机自启动 ── */
+    if (parts[0] === 'autostart') {
+      if (parts.length === 1 && method === 'GET') {
+        return sendJson(res, 200, { ok: true, ...autostartStatus() });
+      }
+      if (parts.length === 1 && method === 'POST') {
+        const rawBody = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(rawBody || '{}'); } catch { body = {}; }
+        try {
+          const st = await setAutostart(!!body.enabled);
+          return sendJson(res, 200, { ok: true, ...st });
+        } catch (e) {
+          return sendJson(res, 400, { ok: false, error: e.message });
+        }
+      }
+    }
+
+    /* ── 一键安装 DSH 插件 / 导出 MCP ── */
+    if (parts[0] === 'install-plugin') {
+      if (method === 'GET') {
+        return sendJson(res, 200, { ok: true, ...installStatus() });
+      }
+      if (method === 'POST') {
+        return sendJson(res, 200, installIntoDsh());
+      }
+    }
+
+    if (parts[0] === 'mcp' && method === 'GET') {
+      return sendJson(res, 200, mcpBundle());
+    }
+
     /* GET /open —— 打开完整记忆界面。
      * 优先用插件内置的界面（同进程、同源、无额外进程）；
      * 只有在界面文件缺失时，才退回到"拉起独立软件"的老路子。 */

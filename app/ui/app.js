@@ -1743,7 +1743,43 @@ function renderSettings() {
         </div>
         <div class="row" style="margin-top:10px">
           <span class="hint" id="kwHint"></span>
-          <button class="btn btn--primary" id="kwSave" style="margin-left:auto">保存权重</button>
+<button class="btn btn--primary" id="kwSave" style="margin-left:auto">保存权重</button>
+        </div>
+      </div>
+
+      <div class="item">
+        <div class="itemHead">
+          <strong>开机自启动</strong>
+          <span class="hint">登录 Windows 后自动打开「本地记忆」，不用每次手动点</span>
+        </div>
+        <div class="hint" style="margin:6px 0">
+          给不用 DeepSeek Harness 的人用：软件得在跑，别的 agent 才连得上。用的是 Windows 启动文件夹里的快捷方式，随时可以关掉。
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="hint" id="asState">读取中…</span>
+          <button class="btn" id="asToggle" style="margin-left:auto">切换</button>
+        </div>
+      </div>
+
+      <div class="item">
+        <div class="itemHead">
+          <strong>装进 DeepSeek Harness</strong>
+          <span class="hint">装完重启 DSH，对话里就有 6 个记忆工具 + 自动回忆</span>
+        </div>
+        <div class="hint" style="margin:6px 0" id="ipHint">正在检查 dsh 命令行…</div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn--primary" id="ipRun" style="margin-left:auto">安装插件</button>
+        </div>
+      </div>
+
+      <div class="item">
+        <div class="itemHead">
+          <strong>给其它 agent 用（MCP）</strong>
+          <span class="hint">Kun / Claude / Cline 这类客户端配好就能读写记忆，不必打开本界面</span>
+        </div>
+        <div class="hint" style="margin:6px 0" id="mcpHint">点「下载 MCP」会下载服务器文件，并把配置片段给你</div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn" id="mcpDownload" style="margin-left:auto">下载 MCP</button>
         </div>
       </div>
 
@@ -1797,6 +1833,71 @@ function renderSettings() {
       toast('衰减设置已保存');
       await refreshMeta();
     } catch (err) { toast('保存失败：' + err.message, true); }
+  });
+
+  // ── 开机自启动 ──
+  async function refreshAutostart() {
+    try {
+      const st = await api('/autostart');
+      const el = $('asState');
+      if (!st.supported) { el.textContent = '当前系统不支持（' + (st.reason || '') + '）'; $('asToggle').disabled = true; return; }
+      el.textContent = st.enabled ? '已开启：开机自动启动' : '未开启';
+      $('asToggle').textContent = st.enabled ? '关闭自启动' : '开启自启动';
+    } catch (err) { $('asState').textContent = '读取失败：' + err.message; }
+  }
+  $('asToggle').addEventListener('click', async () => {
+    try {
+      const st = await api('/autostart');
+      const next = !(st && st.enabled);
+      const r = await api('/autostart', { method: 'POST', body: JSON.stringify({ enabled: next }) });
+      toast(r.enabled ? '已开启开机自启动' : '已关闭开机自启动');
+      await refreshAutostart();
+    } catch (err) { toast('设置失败：' + err.message, true); }
+  });
+
+  // ── 一键装 DSH 插件 ──
+  async function refreshInstall() {
+    try {
+      const st = await api('/install-plugin');
+      const done = st.installed && st.linked && st.bundled;
+      $('ipHint').textContent = done
+        ? '已经装好了：' + (st.pluginDir || '') + '（重启 DSH 生效）'
+        : '还没装进 DSH。点右边按钮会写入 ~/.dsh/plugins 并改当前 profile（改前自动备份 package.json.lm-bak）。';
+      $('ipRun').disabled = false;
+      $('ipRun').textContent = done ? '重新安装' : '安装插件';
+    } catch (err) { $('ipHint').textContent = '检测失败：' + err.message; }
+  }
+  $('ipRun').addEventListener('click', async () => {
+    $('ipRun').disabled = true;
+    $('ipHint').textContent = '安装中…（要联网拉仓库，可能要一两分钟）';
+    try {
+      const r = await api('/install-plugin', { method: 'POST' });
+      if (r.ok) {
+        $('ipHint').textContent = '装好了。重启 DeepSeek Harness 生效。' + (r.changes && r.changes.length ? '（' + r.changes.join('；') + '）' : '');
+        toast('插件已安装，重启 DSH 生效');
+      } else { $('ipHint').textContent = '安装失败：' + (r.error || '未知原因'); toast('安装没成功', true); }
+    } catch (err) { $('ipHint').textContent = '安装失败：' + err.message; toast('安装失败', true); }
+    finally { $('ipRun').disabled = false; }
+  });
+
+  // ── 下载 MCP ──
+  $('mcpDownload').addEventListener('click', async () => {
+    try {
+      const b = await api('/mcp');
+      if (!b.ok) { toast('找不到 MCP 服务器文件', true); return; }
+      // 直接下载服务器文件
+      const blob = new Blob([b.source], { type: 'text/javascript' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'dsh-local-memory-mcp.mjs';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      // 把配置片段也给他（各家键名不同，粘 command/args 就行）
+      const snippet = JSON.stringify(b.config, null, 2);
+      $('mcpHint').textContent = '已下载。填进 agent 的 MCP 配置：' + snippet;
+      try { await navigator.clipboard.writeText(snippet); toast('已下载，配置片段已复制'); }
+      catch { toast('已下载 MCP 文件'); }
+    } catch (err) { toast('下载失败：' + err.message, true); }
   });
 
   $('kwSave').addEventListener('click', async () => {
@@ -1910,6 +2011,9 @@ function renderSettings() {
     $('mInfo').textContent = s.maintenance && s.maintenance.lastAt
       ? `上次 ${new Date(s.maintenance.lastAt).toLocaleString()}`
       : '还没跑过';
+
+    refreshAutostart();
+    refreshInstall();
 
     $('sPaths').innerHTML = [
       `<span class="mono">库：${esc((s.paths && s.paths.db) || '—')}</span>`,

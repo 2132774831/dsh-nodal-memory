@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-memory",
-  "version": "2.7.4",
+  "version": "2.8.0",
   "description": "DeepSeek Harness 纯本地长期记忆：跨对话、跨项目，数据只存本机。默认不联网、不需要 API key；语义检索和关系图可选。附带独立界面（关系图 / 直觉 / 设置），插件只做数据接口和跳转。",
   "keywords": [
     "dsh",

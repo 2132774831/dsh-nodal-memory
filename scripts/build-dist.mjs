@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = path.join(ROOT, 'dist');
 const NAME = 'dsh-local-memory';
-const VERSION = '2.7.4';                 // 发行版用 v2 的入口（工作区那份仍指向 v1，等主人点头）
+const VERSION = '2.8.0';                 // 发行版用 v2 的入口（工作区那份仍指向 v1，等主人点头）
 const STAGE = path.join(DIST, NAME);
 const ZIP = path.join(DIST, `${NAME}-v${VERSION}-win-x64.zip`);
 
@@ -33,6 +33,7 @@ fs.mkdirSync(STAGE, { recursive: true });
 const ITEMS = [
   ['app/server.mjs', 'app/server.mjs'],
   ['app/instance.mjs', 'app/instance.mjs'],
+  ['app/mcp-server.mjs', 'app/mcp-server.mjs'],
   ['app/ui', 'app/ui'],
   ['src/core', 'src/core'],
   ['src/host', 'src/host'],

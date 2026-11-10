@@ -485,3 +485,36 @@ test('内置界面：不许路径穿越（编码过的 ../ 必须挡住）', asy
   const miss = await request(holder, { sub: '/ui/nope.js' });
   assert.equal(miss.code, 404);
 });
+/* ─────────── 设置页三块：自启动 / 装插件 / 导出 MCP ─────────── */
+
+test('GET /autostart 返回可用状态（不真的改系统）', async () => {
+  const { holder } = mount();
+  const r = await request(holder, { sub: '/autostart' });
+  assert.equal(r.code, 200);
+  assert.equal(r.json.ok, true);
+  assert.equal(typeof r.json.supported, 'boolean');
+  assert.equal(typeof r.json.enabled, 'boolean');
+});
+
+test('GET /mcp 给出可用的 MCP 配置和服务器源码', async () => {
+  const { holder } = mount();
+  const r = await request(holder, { sub: '/mcp' });
+  assert.equal(r.code, 200);
+  assert.equal(r.json.ok, true, 'MCP 服务器文件应该存在');
+  assert.ok(r.json.config && typeof r.json.config.command === 'string', '要有 command');
+  assert.ok(Array.isArray(r.json.config.args) && r.json.config.args.length > 0, '要有 args');
+  assert.ok(r.json.config.args[0].endsWith('mcp-server.mjs'), 'args 应指向 mcp-server.mjs');
+  assert.match(r.json.source, /tools\/call/, '源码里应有 tools/call');
+  assert.match(r.json.source, /memory_search/, '源码里应有 memory_search');
+});
+
+test('GET /install-plugin 报告安装状态（不跑命令行也能装）', async () => {
+  const { holder } = mount();
+  const r = await request(holder, { sub: '/install-plugin' });
+  assert.equal(r.code, 200);
+  assert.equal(typeof r.json.installed, 'boolean');
+  assert.equal(typeof r.json.linked, 'boolean');
+  assert.equal(typeof r.json.bundled, 'boolean');
+  // 桌面版用户没有 dsh 命令行，所以这条命令只是"参考"，不能当成安装前提
+  assert.match(r.json.command, /dsh plugin .* add github:2132774831\/dsh-nodal-memory/);
+});
