@@ -111,7 +111,32 @@ export function createRecallHandler(deps) {
         softForget: cfg.features?.softForget !== false,
         forgetAfterDays: cfg.forgetAfterDays,
         halfLifeDays: cfg.halfLifeDays,
+        kindWeight: cfg.kindWeight,
       }).filter((r) => r.record.status !== 'consolidated');   // 已被整合的碎片不再自动注入
+
+      /**
+       * 钉住的记忆（pinned）**每轮都带上**，不管这轮问的是什么。
+       *
+       * 为什么要单独捞：search 里的 pinned 加成只能保证"进了候选就排前面"，
+       * 但"这轮问的是别的事"时它压根不会进候选。而钉住的东西是"铁律"——
+       * 用户的原话是"每次命中"，那就得每轮都在（最多 3 条，避免占满上下文）。
+       */
+      if (cfg.features?.pinAlways !== false) {
+        try {
+          const pinned = (store.list ? store.list({ limit: 2000 }) : [])
+            .filter((r) => (r.pinned === 1 || r.pinned === true)
+              && r.deletedAt == null && r.status !== 'consolidated')
+            .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+            .slice(0, 3);
+          const have = new Set(results.map((r) => r.record.id));
+          for (const rec of pinned.reverse()) {
+            if (have.has(rec.id)) continue;
+            // 钉住的用一条"保送"记录塞到最前面；分数给个占位值，后面渲染只用 record
+            results.unshift({ record: rec, score: 1, why: { pinned: true } });
+          }
+        } catch { /* 拿不到钉住的也不该影响正常回忆 */ }
+      }
+
       if (!results.length) return decision;
 
       const text = renderRecall(results, Date.now(), store.getUpdates ? (id) => store.getUpdates(id) : null);

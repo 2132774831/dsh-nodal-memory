@@ -371,6 +371,7 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
             softForget: cfgForSearch.features?.softForget !== false,
             forgetAfterDays: cfgForSearch.forgetAfterDays,
             halfLifeDays: cfgForSearch.halfLifeDays,
+            kindWeight: cfgForSearch.kindWeight,
           });
           return sendJson(res, 200, {
             ok: true,

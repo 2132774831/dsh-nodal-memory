@@ -1152,7 +1152,7 @@ function renderList() {
              <div class="itemActions">
                ${rec.deletedAt
                  ? '<button class="btn" data-act="restore">恢复</button><button class="btn btn--danger" data-act="purge">彻底删除</button>'
-                 : '<button class="btn" data-act="progress">追加进展</button><button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>'}
+                 : `<button class="btn${rec.pinned ? ' btn--primary' : ''}" data-act="pin" title="钉住后每轮自动回忆都会带上它">${rec.pinned ? '★ 已置顶' : '☆ 置顶'}</button><button class="btn" data-act="progress">追加进展</button><button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>`}
              </div>`}
       </div>`;
     }).join('');
@@ -1196,10 +1196,18 @@ function renderList() {
     }
 
     try {
-      if (act === 'delete') await api('/memories/' + encodeURIComponent(id), { method: 'DELETE' });
+      if (act === 'pin') {
+          // 置顶/取消置顶：钉住的记忆每轮自动回忆都会带上（见 recall.js）
+          const d = await fetchDetail(id);
+      const cur = !!(d && d.memory && d.memory.pinned);
+      detailCache.delete(id);   // 状态变了，缓存作废
+          await api('/memories/' + encodeURIComponent(id), { method: 'POST', body: JSON.stringify({ pinned: !cur }) });
+          toast(cur ? '已取消置顶' : '已置顶：每轮自动回忆都会带上它');
+        }
+        else if (act === 'delete') await api('/memories/' + encodeURIComponent(id), { method: 'DELETE' });
       else if (act === 'purge') await api('/memories/' + encodeURIComponent(id) + '/purge', { method: 'POST' });
       else if (act === 'restore') await api('/memories/' + encodeURIComponent(id) + '/restore', { method: 'POST' });
-      toast({ delete: '已删除（可恢复）', purge: '已彻底删除', restore: '已恢复' }[act] || '完成');
+      toast({ pin: '置顶已更新', delete: '已删除（可恢复）', purge: '已彻底删除', restore: '已恢复' }[act] || '完成');
       await load(queryEl.value);
       await refreshMeta();
     } catch (err) { toast('操作失败：' + err.message, true); }
@@ -1708,6 +1716,38 @@ function renderSettings() {
       </div>
 
       <div class="item">
+        <div class="itemHead">
+          <strong>类别命中权重</strong>
+          <span class="hint">数字越大越容易被想起；只影响排序，不改数据</span>
+        </div>
+        <div class="hint" style="margin:6px 0">
+          默认都是 1。想让「情感」多被想起就调大（比如 2）；嫌某类太吵就调小（比如 0.5）。范围 0.1 ~ 5。
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:8px">
+          <label class="row" style="gap:6px">
+            <span class="label">工作</span>
+            <input class="input" type="number" id="kwWork" min="0.1" max="5" step="0.1" style="width:90px" />
+          </label>
+          <label class="row" style="gap:6px">
+            <span class="label">偏好</span>
+            <input class="input" type="number" id="kwPreference" min="0.1" max="5" step="0.1" style="width:90px" />
+          </label>
+          <label class="row" style="gap:6px">
+            <span class="label">情感</span>
+            <input class="input" type="number" id="kwEmotion" min="0.1" max="5" step="0.1" style="width:90px" />
+          </label>
+          <label class="row" style="gap:6px">
+            <span class="label">未分类</span>
+            <input class="input" type="number" id="kwUnknown" min="0.1" max="5" step="0.1" style="width:90px" />
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="hint" id="kwHint"></span>
+          <button class="btn btn--primary" id="kwSave" style="margin-left:auto">保存权重</button>
+        </div>
+      </div>
+
+      <div class="item">
         <div class="itemHead"><strong>维护</strong><span class="hint" id="mInfo"></span></div>
         <div class="hint" style="margin:6px 0">
           维护只做安全的事：清掉指向已删除记忆的孤儿关系、记一份统计快照。
@@ -1755,6 +1795,29 @@ function renderSettings() {
         }),
       });
       toast('衰减设置已保存');
+      await refreshMeta();
+    } catch (err) { toast('保存失败：' + err.message, true); }
+  });
+
+  $('kwSave').addEventListener('click', async () => {
+    const read = (id, fallback = 1) => {
+      const n = Number($(id).value);
+      if (!Number.isFinite(n) || n <= 0) return fallback;
+      return Math.min(5, Math.max(0.1, n));
+    };
+    try {
+      await api('/config', {
+        method: 'POST',
+        body: JSON.stringify({
+          kindWeight: {
+            work: read('kwWork'),
+            preference: read('kwPreference'),
+            emotion: read('kwEmotion'),
+            unknown: read('kwUnknown'),
+          },
+        }),
+      });
+      toast('类别权重已保存');
       await refreshMeta();
     } catch (err) { toast('保存失败：' + err.message, true); }
   });
@@ -1836,6 +1899,13 @@ function renderSettings() {
     $('hlEmotion').value = String(hl.emotion ?? 60);
     $('hlUnknown').value = String(hl.unknown ?? 365);
     $('hlHint').textContent = `情感 ${hl.emotion ?? 60} 天半衰 ＝ 两个月后相关度剩一半；改完只影响排序`;
+    // 类别权重
+    const kw = s.config.kindWeight || {};
+    $('kwWork').value = String(kw.work ?? 1);
+    $('kwPreference').value = String(kw.preference ?? 1);
+    $('kwEmotion').value = String(kw.emotion ?? 1);
+    $('kwUnknown').value = String(kw.unknown ?? 1);
+    $('kwHint').textContent = `情感 ${kw.emotion ?? 1}× ＝ 情感类命中排位按此放大`;
     $('fSens').value = s.config.conflictSensitivity || 'normal';
     $('mInfo').textContent = s.maintenance && s.maintenance.lastAt
       ? `上次 ${new Date(s.maintenance.lastAt).toLocaleString()}`

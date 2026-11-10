@@ -9,6 +9,25 @@
   --ok: #4a9d6a;
 }
 
+/* ── 滚动条 ──
+ * 浏览器默认的滚动条是浅色（白/浅灰），在深色界面上非常扎眼。
+ * 这里：轨道透明（露出底色＝黑的），只有滑块是灰的；宽度收到 6px，
+ * 比默认细一半，存在感降到刚好能看见。
+ * 同时写 Firefox 的 scrollbar-width/color，免得那边还是默认样式。
+ */
+* {
+  scrollbar-width: thin;                       /* Firefox */
+  scrollbar-color: #3b4048 transparent;        /* 滑块 / 轨道 */
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #3b4048;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: #4d545e; }
+::-webkit-scrollbar-corner { background: transparent; }
+
 * { box-sizing: border-box; }
 
 html, body {

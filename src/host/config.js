@@ -110,6 +110,18 @@ export const DEFAULTS = {
     emotion: 60,
     unknown: 365,
   },
+
+  /**
+   * 每类记忆的命中权重乘子。默认都是 1。
+   * 想让"情感类"更容易被想起就调大（比如 2），觉得某类太吵就调小（比如 0.5）。
+   * 它只影响排序，不改任何数据。
+   */
+  kindWeight: {
+    work: 1,
+    preference: 1,
+    emotion: 1,
+    unknown: 1,
+  },
   /** 冲突检测灵敏度：strict 严（少而准）/ normal 标准 / loose 松（多而杂） */
   conflictSensitivity: 'normal',
 
@@ -146,6 +158,7 @@ export function normalizeConfig(input) {
     features: { ...DEFAULTS.features },
     privacy: { ...DEFAULTS.privacy },
     halfLifeDays: { ...DEFAULTS.halfLifeDays },
+    kindWeight: { ...DEFAULTS.kindWeight },
   };
   const src = input && typeof input === 'object' ? input : {};
 
@@ -181,6 +194,18 @@ export function normalizeConfig(input) {
       // 注意：这里**不是** `p.maskPII === true`。
       // 隐私开关默认开，配置里写坏/没写都必须落到"开"，只有显式 false 才关。
       out.privacy = { maskPII: p.maskPII !== false };
+      continue;
+    }
+
+    if (key === 'kindWeight') {
+      const w = value && typeof value === 'object' ? value : {};
+      const merged = { ...DEFAULTS.kindWeight };
+      for (const k of Object.keys(DEFAULTS.kindWeight)) {
+        const n = Number(w[k]);
+        // 0 会让这一类永远排不上来（等于静默关掉），夹到 0.1~5
+        if (Number.isFinite(n) && n > 0) merged[k] = Math.min(5, Math.max(0.1, n));
+      }
+      out.kindWeight = merged;
       continue;
     }
 

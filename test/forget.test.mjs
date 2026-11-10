@@ -168,3 +168,110 @@ test('自动注入不参与频次加成（掐掉"注入越多越容易被注入"
   assert.ok(ua <= 2, '加成有上限，不能无限涨');
   store.close();
 });
+
+test('衰减看"最后一次被用到"，不是创建时间（天天用的老记忆不该被压）', () => {
+  const store = mkStore();
+  const now = Date.now();
+  const year = now - 365 * DAY;
+  // 一年前写的，但昨天还被检索到
+  store.put({
+    content: '一年前定的约定，但昨天刚被用到',
+    kind: 'work', importance: 'key',
+    createdAt: year, updatedAt: year, lastAccessed: now - DAY,
+  });
+  // 昨天刚写，一次没用过
+  store.put({
+    content: '昨天刚写还没用过的',
+    kind: 'work', importance: 'key',
+    createdAt: now - DAY, updatedAt: now - DAY,
+  });
+
+  const used = hitOf(store, '一年前定的约定', { now });
+  const fresh = hitOf(store, '昨天刚写还没用过', { now });
+  assert.ok(used.why.decay > 0.95, '一直在用的记忆不该衰减，实际 ' + used.why.decay);
+  assert.ok(used.why.decay >= fresh.why.decay - 1e-9, '用过的老记忆不应该比没用过的新记忆更糟');
+  store.close();
+});
+
+test('衰减：用过一阵子后又没人用了，从那之后开始衰减', () => {
+  const store = mkStore();
+  const now = Date.now();
+  const year = now - 365 * DAY;
+  store.put({
+    content: '一年前写的，半年前最后用过一次',
+    kind: 'work', importance: 'key',
+    createdAt: year, updatedAt: year, lastAccessed: now - 180 * DAY,
+  });
+  const r = hitOf(store, '半年前最后用过', { now });
+  // 半衰期 365 天，180 天 ≈ 0.5^(180/365) ≈ 0.71
+  assert.ok(r.why.decay > 0.6 && r.why.decay < 0.8, '应从最后一次使用算起，实际 ' + r.why.decay);
+  store.close();
+});
+/* ───────────── 类别权重 ─────────────
+ * 主人要的："能不能单独提高情感这一类什么的命中率"。
+ * 只影响排序，不动数据。 */
+
+test('类别权重：把情感调高，同样的查询情感就能排到工作前面', () => {
+  const store = mkStore();
+  const now = Date.now();
+  store.put({ content: '关于记忆插件的偏好说明', kind: 'work', importance: 'important', createdAt: now, updatedAt: now });
+  store.put({ content: '关于记忆插件的心情感受', kind: 'emotion', importance: 'important', createdAt: now, updatedAt: now });
+
+  const base = search(store, '记忆插件', { now });
+  const workBase = base.findIndex((h) => h.record.kind === 'work');
+  const emotBase = base.findIndex((h) => h.record.kind === 'emotion');
+
+  const boosted = search(store, '记忆插件', { now, kindWeight: { work: 1, preference: 1, emotion: 3, unknown: 1 } });
+  const emotBoost = boosted.findIndex((h) => h.record.kind === 'emotion');
+  assert.equal(emotBoost, 0, '情感权重调到 3 之后应排第一（原来第 ' + (emotBase + 1) + '）');
+  assert.ok(workBase >= 0, '工作那条不该消失');
+  store.close();
+});
+
+test('类别权重：压到 0.1 也不会让这一类彻底消失', () => {
+  const store = mkStore();
+  const now = Date.now();
+  store.put({ content: '一条情感记忆', kind: 'emotion', importance: 'important', createdAt: now, updatedAt: now });
+  const hits = search(store, '情感记忆', { now, kindWeight: { work: 1, preference: 1, emotion: 0.1, unknown: 1 } });
+  assert.ok(hits.length > 0, '压权重只是排序靠后，不该查不到');
+  store.close();
+});
+
+/* ───────────── 强制命中（置顶） ───────────── */
+
+test('置顶：只要进了候选，钉住的就排第一（不靠相关度取胜）', () => {
+  const store = mkStore();
+  const now = Date.now();
+  // 两条都能匹配"中文"，但普通那条的相关度更高、更新、更重要
+  store.put({ content: '中文', kind: 'work', importance: 'key', createdAt: now, updatedAt: now, pinned: 1 });
+  store.put({
+    content: '中文中文中文 记忆插件的完整技术笔记，写得非常详细',
+    kind: 'work', importance: 'key', createdAt: now, updatedAt: now,
+  });
+
+  const hits = search(store, '中文', { now });
+  assert.equal(hits[0].record.content, '中文', '钉住的应排第一，即使它内容更短、相关度更低');
+  assert.ok(hits.find((h) => h.record.content.includes('技术笔记')), '普通命中的也要在');
+  store.close();
+});
+
+test('置顶：完全无关的钉住条目不会污染显式搜索（那是自动回忆的职责）', () => {
+  const store = mkStore();
+  const now = Date.now();
+  store.put({ content: '铁律：回复一律用中文', kind: 'work', importance: 'key', createdAt: now, updatedAt: now, pinned: 1 });
+  store.put({ content: '记忆插件的实现笔记', kind: 'work', importance: 'important', createdAt: now, updatedAt: now });
+  const hits = search(store, '插件', { now });
+  assert.ok(!hits.some((h) => h.record.content.includes('用中文')),
+    '显式搜索不该塞入完全无关的条目；每轮必带由 recall.js 负责');
+  store.close();
+});
+
+test('置顶：钉住的不受"陈旧过滤"影响（长期有效的规矩）', () => {
+  const store = mkStore();
+  const now = Date.now();
+  const old = now - 400 * DAY;
+  store.put({ content: '铁律：数据库只读，测试不许写真库', kind: 'work', importance: 'key', createdAt: old, updatedAt: old, lastAccessed: old, pinned: 1 });
+  const hits = search(store, '铁律', { now, includeStale: false });
+  assert.ok(hits.length > 0, '钉住的老规矩不该被"陈旧"过滤掉');
+  store.close();
+});

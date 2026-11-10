@@ -323,6 +323,7 @@ export function buildTools(deps) {
           softForget: cfg.features?.softForget !== false,
           forgetAfterDays: cfg.forgetAfterDays,
           halfLifeDays: cfg.halfLifeDays,
+        kindWeight: cfg.kindWeight,
         };
         let results = coreSearch(store, query, { limit, filters, queryVector, ...forgetOpts });
 

@@ -38,14 +38,26 @@ const DEFAULT_MIN_COVERAGE = 0.5;
  *   - 超过 forgetAfterDays 后线性加重，最低压到 0.4 倍，**不会归零**
  */
 /**
- * 计算"这条记忆有多新"用的时钟。
+ * 计算"这条记忆有多新鲜"用的时钟 —— 也就是半衰期从哪天开始算。
  *
- * ⚠ 必须取 max(创建, 更新)：一条 400 天前写的记忆如果昨天刚被追加过进展，
- * 它承载的信息是新鲜的。只看 createdAt 会把它当死数据——
- * 这是外部评审（Kimi）点出来的真 bug。
+ * ⚠ **看的是"最后一次被用到/更新"，不是创建时间。**
+ *
+ * 为什么：主人 2026-11-10 指出的设计错误 —— 半衰期原本按 createdAt 算，
+ * 结果"天天被检索到的老记忆"照样掉分（365 天的 work 记忆 decay=0.5，
+ * 而昨天刚写、一次没用过的还是 1.0），等于"没用过的新记忆压过天天在用的老记忆"。
+ * 现在的语义才是对的：**没人用了才衰减**，一直用就一直新鲜。
+ *
+ * 三个时间取最大：
+ *   lastAccessed —— 被检索/注入过
+ *   updatedAt    —— 追加过进展（信息本身变新了）
+ *   createdAt    —— 兜底
  */
 function activityAt(record) {
-  return Math.max(record.createdAt || 0, record.updatedAt || 0) || null;
+  return Math.max(
+    record.lastAccessed || 0,
+    record.updatedAt || 0,
+    record.createdAt || 0,
+  ) || null;
 }
 
 function neglectFactor(record, now, { softForget, forgetAfterDays }) {
@@ -119,6 +131,8 @@ export function search(store, query, opts = {}) {
     softForget = true,
     forgetAfterDays = 180,
     halfLifeDays = null,
+    // 每类权重（工作/偏好/情感/未分类各一个乘子），用户可调；不传就都是 1
+    kindWeight = null,
   } = opts;
 
   const q = String(query ?? '').trim();
@@ -226,16 +240,27 @@ export function search(store, query, opts = {}) {
     // 但 neglect === 1 表示"这条不适用软遗忘"，此时只用 decay——
     // 直接写 max(decay, neglect) 会让所有记忆的 decay 都被 1 抵消掉（踩过）。
     const timeFactor = neglect < 1 ? Math.max(decay, neglect) : decay;
-    const score = relevance * impFactor * timeFactor * usage;
+    // 类别权重：让用户能把"情感类"或"偏好类"单独调高/调低命中率
+    const kw = kindWeight && Number(kindWeight[item.record.kind]);
+    const kindFactor = (Number.isFinite(kw) && kw > 0) ? Math.min(5, Math.max(0.1, kw)) : 1;
+
+    let score = relevance * impFactor * timeFactor * usage * kindFactor;
+
+    // 强制命中：钉住的记忆（项目规矩、铁律）只要进了候选就排最前。
+    // 乘一个大系数而不是直接置 1，是为了保留相对顺序（多条 pinned 之间还按相关度排）。
+    const pinned = item.record.pinned === 1 || item.record.pinned === true;
+    if (pinned) score *= 1000;
+
+    // 钉住的不该被 minScore 拦掉
 
     // 精确覆盖（查询的每个 token 都命中）不该因为"旧"而彻底消失——
     // 用户拿原话去搜，就该给他，哪怕这条很老。衰减只该让它往后排（score 里已经体现）。
     const exactHit = cov.total > 0 && cov.matched === cov.total;
-    if (score < minScore && !exactHit) continue;
+    if (score < minScore && !exactHit && !pinned) continue;
 
     const rel = formatRelative(clock, now);
     const fresh = freshness(clock, now);
-    if (!includeStale && fresh.stale) continue;
+    if (!includeStale && fresh.stale && !pinned) continue;
 
     results.push({
       record: item.record,
