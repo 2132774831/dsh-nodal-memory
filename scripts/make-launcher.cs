@@ -234,7 +234,7 @@ internal static class Launcher
         }
 
         StringBuilder argLine = new StringBuilder();
-        argLine.Append('"').Append(server).Append("\" --open");
+        argLine.Append('"').Append(server).Append("\" --open --idle-min 0");   // 用户自己打开的实例不该被闲置计时杀掉
 
         // First run: import the old v1 JSON library when there is no v2 db yet.
         try

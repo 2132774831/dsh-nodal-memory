@@ -45,7 +45,11 @@ function parseArgs(argv) {
     else if (a === '--data') out.data = path.resolve(argv[++i]);
     else if (a === '--state') out.state = path.resolve(argv[++i]);
     else if (a === '--parent-pid') out.parentPid = Number(argv[++i]) || 0;
-    else if (a === '--idle-min') out.idleMin = Math.max(1, Number(argv[++i]) || 10);
+    // 0 = 永不自动退出（桌面图标启动的场景）；>0 = 闲置多少分钟后收掉（插件拉起的场景）
+  else if (a === '--idle-min') {
+    const n = Number(argv[++i]);
+    out.idleMin = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 10;
+  }
     else if (a === '--no-lock') out.noLock = true;
     else if (a === '--seed') {
       // `--seed` 后面没跟值（或跟了另一个参数）时用默认路径：
@@ -279,7 +283,7 @@ if (isMain) {
                     —— 和插件共用同一个库 dsh-local-memory.db，别改成别处
   --state <目录>    实例状态目录，默认 $DSH_HOME\\local-memory
   --parent-pid <N>  拉起本进程的父进程（DSH）：它消失后闲置到点就自动退出
-  --idle-min <N>    闲置多少分钟后自动退出，默认 10
+  --idle-min <N>    闲置多少分钟后自动退出，默认 10；传 0 = 永不退出（桌面图标用）
   --no-lock         跳过单实例检查（测试用）
   --seed <文件>     首次启动时把这份 v1 JSON 库复制进来（会自动迁移成 SQLite）
 
@@ -396,6 +400,7 @@ if (isMain) {
   // 这样 DSH 退出后不会一直留个进程，用户手动打开时也不会因为"没人关"而常驻。
   const watchdog = startWatchdog({
     parentPid: opts.parentPid || 0,
+    // 0 传下去 = 永不自动退出（见 instance.mjs 的判断）
     idleMs: opts.idleMin * 60 * 1000,
     onExit: shutdown,
     log: (msg) => console.log('[生命周期] ' + msg),

@@ -198,6 +198,11 @@ export function startWatchdog({ parentPid = 0, idleMs = 10 * 60 * 1000, interval
         if (isPidAlive(parentPid)) { parentGoneAt = 0; return; }
         if (parentGoneAt === 0) { parentGoneAt = now; log('上游进程已退出，开始计时'); return; }
       }
+      // idleMs <= 0 = **永不自动退出**。
+      // 用户自己双击图标打开的实例不该被"闲置计时"杀掉——他会离开一会儿再回来，
+      // 那时窗口还在，而不是一个"连接被拒绝"。只有插件拉起的临时实例才需要自动收
+      // （那类实例带 --parent-pid，DSH 关掉后由下面那段逻辑收尾）。
+      if (!(idleMs > 0)) return;
       const idleFor = now - lastRequestAt;
       if (idleFor >= idleMs) {
         log(`已闲置 ${Math.round(idleFor / 1000)} 秒，自动退出`);
