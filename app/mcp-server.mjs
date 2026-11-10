@@ -20,7 +20,29 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PKG_ROOT = path.resolve(HERE, '..');
+
+/**
+ * 找"包根目录"（里面有 src/core 的那个）。
+ *
+ * ⚠ 必须带候选列表：这个文件会被用户下载到任意位置（比如"下载"文件夹），
+ * 那时相对路径 `../src/core` 根本不存在——实测直接 ERR_MODULE_NOT_FOUND。
+ * 所以依次试：自己在包内 → 独立软件安装目录 → ~/.dsh/plugins/... → DSH_HOME 下的插件目录。
+ */
+function findPackageRoot() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const cands = [
+    path.resolve(HERE, '..'),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-local-memory-app') : null,
+    home ? path.join(home, '.dsh', 'plugins', 'dsh-local-memory') : null,
+    process.env.DSH_HOME ? path.join(process.env.DSH_HOME, 'plugins', 'dsh-local-memory') : null,
+  ].filter(Boolean);
+  for (const c of cands) {
+    try { if (fs.existsSync(path.join(c, 'src', 'core', 'index.js'))) return c; } catch { /* 下一个 */ }
+  }
+  throw new Error('找不到本地记忆的安装目录（试过：' + cands.join(' / ') + '）。请先安装一次独立软件或插件。');
+}
+
+const PKG_ROOT = findPackageRoot();
 const { openStore } = await import('file:///' + path.join(PKG_ROOT, 'src', 'core', 'index.js'));
 const { search } = await import('file:///' + path.join(PKG_ROOT, 'src', 'core', 'search.js'));
 
