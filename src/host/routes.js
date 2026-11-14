@@ -15,6 +15,8 @@
 import { readConfig, writeConfig, DEFAULTS, NS, configFile } from './config.js';
 import { buildGraph } from '../core/graph.js';
 import { search } from '../core/search.js';
+import { decayFactor } from '../core/time.js';
+import { IMPORTANCE_WEIGHT } from '../core/schema.js';
 import { runMaintenance, maintenanceInfo } from '../core/maintenance.js';
 import { findConflicts, reviewCandidates } from '../core/insight.js';
 import { inferKindFromContent, classifyBatch } from '../core/classify.js';
@@ -649,7 +651,27 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           const rec = store.get(id);
           if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
           // 带上进展时间轴：原记录 + 后续补充一起看才是完整的
-          return sendJson(res, 200, { ok: true, memory: rec, updates: store.getUpdates(id) });
+          // 顺带算出这条记忆"现在值多少分"（不含查询相关度）——
+          // 关系图右侧要显示，用户才知道它为什么排在那里。
+          const mcfg = readConfig();
+          const clock = Math.max(rec.lastAccessed || 0, rec.updatedAt || 0, rec.createdAt || 0);
+          const decay = decayFactor(clock, rec.kind, Date.now(), mcfg.halfLifeDays);
+          const impFactor = 0.6 + 0.4 * (IMPORTANCE_WEIGHT[rec.importance] ?? 0.8);
+          const usage = Math.min(2, 1 + 0.15 * Math.log1p((rec.searchedCount || 0) + 0.3 * (rec.injectedCount || 0)));
+          const kwRaw = mcfg.kindWeight ? Number(mcfg.kindWeight[rec.kind]) : NaN;
+          const kindFactor = (Number.isFinite(kwRaw) && kwRaw > 0) ? Math.min(5, Math.max(0.1, kwRaw)) : 1;
+          const metrics = {
+            weight: impFactor * decay * usage * kindFactor,
+            impFactor,
+            decay,
+            usage,
+            kindFactor,
+            pinned: rec.pinned === 1 || rec.pinned === true,
+            lastAccessed: rec.lastAccessed || null,
+            searchedCount: rec.searchedCount || 0,
+            injectedCount: rec.injectedCount || 0,
+          };
+          return sendJson(res, 200, { ok: true, memory: rec, updates: store.getUpdates(id), metrics });
         }
 
         if (parts.length === 3) {

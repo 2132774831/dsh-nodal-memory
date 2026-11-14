@@ -16,6 +16,7 @@
 import { randomUUID } from 'node:crypto';
 import { NS } from './config.js';
 import { search } from '../core/search.js';
+import { expandByGraph } from '../core/expand.js';
 import { formatRelative } from '../core/time.js';
 
 /** 从消息数组里取最后一条**真人**说的话 */
@@ -105,7 +106,7 @@ export function createRecallHandler(deps) {
         try { queryVector = await deps.embedQuery(query); } catch { queryVector = null; }
       }
 
-      const results = search(store, query, {
+      let results = search(store, query, {
         limit: cfg.autoRecallMaxItems,
         queryVector,
         softForget: cfg.features?.softForget !== false,
@@ -113,6 +114,12 @@ export function createRecallHandler(deps) {
         halfLifeDays: cfg.halfLifeDays,
         kindWeight: cfg.kindWeight,
       }).filter((r) => r.record.status !== 'consolidated');   // 已被整合的碎片不再自动注入
+
+      // 图扩展召回（默认关）：关键词命中少时，沿共现边补几条邻居。
+      // 限制写在 expand.js 里（1 跳 / 最多 3 条 / ×0.3 / 只在 <3 条时触发）。
+      if (cfg.features?.graphExpand) {
+        try { results = expandByGraph(store, results); } catch { /* 扩展失败不影响正常回忆 */ }
+      }
 
       /**
        * 钉住的记忆（pinned）**每轮都带上**，不管这轮问的是什么。

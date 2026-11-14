@@ -10,6 +10,7 @@
  */
 
 import { search as coreSearch } from '../core/search.js';
+import { expandByGraph } from '../core/expand.js';
 import { formatRelative, toMs } from '../core/time.js';
 import { ENUMS } from '../core/schema.js';
 import { inferKindFromContent } from '../core/classify.js';
@@ -340,6 +341,11 @@ export function buildTools(deps) {
           }
           results.sort((a, b) => b.score - a.score);
           results = results.slice(0, limit);
+        }
+
+        // 图扩展召回（默认关）：命中太少时沿共现边补邻居，和自动回忆同一套限制
+        if (cfg.features?.graphExpand) {
+          try { results = expandByGraph(store, results); } catch { /* 扩展失败不影响检索 */ }
         }
 
         const total = store.count();

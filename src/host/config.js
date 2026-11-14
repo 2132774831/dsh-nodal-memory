@@ -83,6 +83,9 @@ export const DEFAULTS = {
     // 时间相邻边虽然"没信息量"，但它是唯一把记忆按时间串开、不让布局塌成一团的力。
     // 实测关掉后中间挤成一坨、文字互相压住，所以默认开着。
     timeEdges: true,
+    // 图扩展召回：关键词命中太少时，沿共现边补几条邻居（默认关，防自我强化回路）
+    graphExpand: false,
+
     // 直觉页
     dueReview: true,         // 「该想起的」
     conflictScan: true,      // 「疑似冲突」

@@ -475,16 +475,31 @@ function renderGraph() {
     for (let i = 0; i < layout.count; i++) {
       const node = layout.nodes[i];
       const [x, y] = toScreen(layout.px[i], layout.py[i]);
-      const r = Math.max(3.5, Math.min(11, 4 + Math.log1p(node.degree || 0) * 1.8)) * viewport.scale;      const dim = needle && !(
+      const matched = !!needle && (
         String(node.label).toLowerCase().includes(needle)
         || (node.tags || []).some((t) => String(t).toLowerCase().includes(needle))
       );
+      // 命中：半径放大 + 呼吸（同一套 needle 规则，和变暗判断一致）
+      const pulse = matched ? 1.18 + 0.10 * Math.sin(performance.now() / 260) : 1;
+      const r = Math.max(3.5, Math.min(11, 4 + Math.log1p(node.degree || 0) * 1.8)) * viewport.scale * pulse;
+      const dim = needle && !matched;
       ctx.save();
       ctx.globalAlpha = dim ? 0.15 : 1;
+      if (matched) {
+        // 光晕：让命中项在一片点里一眼看出来
+        ctx.shadowColor = kindColor(node.kind);
+        ctx.shadowBlur = 14 * Math.max(0.6, viewport.scale);
+      }
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fillStyle = kindColor(node.kind);
       ctx.fill();
+      ctx.shadowBlur = 0;
+      if (matched) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+      }
       if (node.isolated) {
         ctx.strokeStyle = 'rgba(217,83,79,.85)';
         ctx.lineWidth = 1.4;
@@ -639,10 +654,11 @@ function renderGraph() {
       const h = CARD_H * scale;
       if (w < 24) continue; // 缩得太小就别画了，画出来也是黑块
 
-      const dim = needle && !(
+      const matched = !!needle && (
         String(node.label).toLowerCase().includes(needle)
         || (node.tags || []).some((t) => String(t).toLowerCase().includes(needle))
       );
+      const dim = needle && !matched;
       const accent = kindColor(node.kind);
       const headH = Math.min(CARD_HEAD * scale, h * 0.4);
       const inFocus = !focusId || focusSet.has(node.id);
@@ -682,6 +698,20 @@ function renderGraph() {
             : (focusId && inFocus ? `hsla(${node.hue}, 72%, 64%, 0.8)` : 'rgba(150,155,165,0.32)');
       ctx.lineWidth = isActive ? 1.8 : ((conflicting || isAssoc) ? 1.8 : 1);
       ctx.stroke();
+
+      // 命中的卡片：加一圈呼吸的蓝色描边 + 光晕（和普通边框区分开）
+      if (matched) {
+        const beat = 1.6 + 0.9 * (0.5 + 0.5 * Math.sin(performance.now() / 260));
+        ctx.save();
+        ctx.globalAlpha = 1;
+        ctx.shadowColor = 'rgba(74,144,217,0.95)';
+        ctx.shadowBlur = 16 * Math.max(0.6, scale);
+        roundRect(x - 1, y - 1, w + 2, h + 2, 7 * scale);
+        ctx.strokeStyle = 'rgba(106,170,255,0.98)';
+        ctx.lineWidth = beat;
+        ctx.stroke();
+        ctx.restore();
+      }
 
       // 疑似冲突角标（左下角黄色小三角）
       if (conflicting) {
@@ -759,6 +789,8 @@ function renderGraph() {
     }
     // 卡片模式：即使力已收敛也要继续压重叠，否则一收敛就停在"还压着"的状态
     if (layout && mode === 'cards' && separateCards(layout)) needsDraw = true;
+    // 过滤框里有词时保持重绘：命中节点要做呼吸动画（清空后自动停，不空转风扇）
+    if (filter.trim() && layout && layout.count > 0) needsDraw = true;
     // 收敛且没交互时不再重绘：rAF 空转会让风扇一直转
     if (needsDraw) {
       draw();
@@ -935,14 +967,85 @@ function renderGraph() {
       ${tags ? `<div class="meta" style="margin:6px 0">${tags}</div>` : ''}
       <div class="body">${esc(inlineText(selected.label || ''))}</div>
       <div class="mono" style="margin-top:8px">${esc(selected.id)}</div>
-      <div class="bar" style="margin-top:10px"><button class="btn" id="gClose">关闭</button></div>`;
+      <div class="nodeState" id="gState">读取状态中…</div>
+      <div class="bar" style="margin-top:10px">
+        <button class="btn btn--primary" id="gGoList">在列表里打开</button>
+        <button class="btn" id="gClose">关闭</button>
+      </div>`;
     const close = document.getElementById('gClose');
     if (close) close.onclick = () => { selected = null; renderSide(); };
     // 侧栏里先把截断标签显示出来（立刻有反馈），再补全文
-    fetchDetail(selected.id).then((d) => {
+    const pickedId = selected.id;
+    fetchDetail(pickedId).then((d) => {
       if (!selected || d === null) return;
       patchDetail(side, d, '.body');
+      // 底部小字：这条记忆"现在什么状态"——为什么排在这、还用不用得上
+      const st = document.getElementById('gState');
+      const m = d.metrics;
+      if (st && m) {
+        const bits = [
+          '权重 ' + m.weight.toFixed(2),
+          '衰减 ' + m.decay.toFixed(2),
+          '重要度 ' + m.impFactor.toFixed(2),
+          '频次 ' + m.usage.toFixed(2),
+        ];
+        if (m.kindFactor !== 1) bits.push('类别×' + m.kindFactor);
+        const use = [];
+        if (m.searchedCount) use.push('检索 ' + m.searchedCount);
+        if (m.injectedCount) use.push('注入 ' + m.injectedCount);
+        bits.push('用 ' + (use.length ? use.join(' / ') : '0 次'));
+        bits.push(m.lastAccessed ? '最后使用 ' + ageLabel(m.lastAccessed) : '从没用过');
+        if (m.pinned) bits.push('★ 已置顶');
+        st.textContent = bits.join(' · ');
+      } else if (st) {
+        st.textContent = '';
+      }
     });
+
+    const goList = document.getElementById('gGoList');
+    if (goList) goList.onclick = async () => {
+      // 跳到记忆列表并定位到这一条。
+      // ⚠ 不能直接引用列表里的 queryEl——它声明在 renderList() 内部，
+      //   这里是图的作用域，引用会 ReferenceError（踩过：点了没反应）。
+      //   所以走 DOM + 真实点击事件，并且等列表 DOM 建出来。
+      const d = await fetchDetail(pickedId);
+      const text = ((d && d.memory && d.memory.content) || selected.label || '').slice(0, 12).trim();
+      pendingFocusId = pickedId;
+      // ⚠ 不能只改 location.hash：应用只在启动时读 hash，没有 hashchange 监听，
+      //   改 hash 只会变更 URL，页面不会切换（踩过：跳过去一片空白）。
+      //   点页签按钮才会真的 switchTab → 渲染列表。
+      const tab = document.querySelector('.tab[data-tab="list"]');
+      if (tab) tab.click();
+      else location.hash = '#list';
+      const tryFocus = (n = 0) => {
+        const input = document.getElementById('lQuery');
+        if (!input) {
+          if (n < 30) setTimeout(() => tryFocus(n + 1), 100);
+          return;
+        }
+        input.value = text;
+        const btn = document.getElementById('lSearch');
+        if (btn) btn.click();
+        else input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        setTimeout(() => focusCard(pickedId), 700);
+      };
+      setTimeout(() => tryFocus(), 100);
+    };
+  }
+
+  /**
+   * 从关系图跳到列表后，把目标卡片滚到眼前并闪一下。
+   * 列表是重新渲染的，所以要在渲染完成之后再找 DOM。
+   */
+  let pendingFocusId = null;
+  function focusCard(id) {
+    if (!id) return;
+    const el = document.querySelector('.item[data-id="' + CSS.escape(id) + '"]');
+    if (!el) { pendingFocusId = null; return; }
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.classList.add('item--flash');
+    setTimeout(() => el.classList.remove('item--flash'), 1800);
+    pendingFocusId = null;
   }
 
   function fitView() {
@@ -1934,6 +2037,7 @@ function renderSettings() {
     ['dueReview', '该想起的', '直觉页列出重要、搁得久、几乎没用过的记忆'],
     ['projectEdges', '同项目边（弱）', '只说明"同一摊事"。59 条同项目曾连出 1711 条边的毛线球，默认关'],
     ['timeEdges', '时间相邻边', '本身信息量很低，但它是把记忆按时间串开的力——关掉后布局会塌成一团'],
+    ['graphExpand', '图扩展召回', '关键词命中少于 3 条时，沿「被一起用过」的边补几条邻居。默认关——共现边用多了会自我强化'],
     ['softForget', '软遗忘（降权不删）', '长期没用过的低价值记忆会往后排，但一条都不会删；关掉＝纯按相关度和时间排'],
     ['autoKind', '写入时自动分类', '按内容粗分工作/偏好/情感，决定衰减速度；误判可以到补标页改'],
   ];

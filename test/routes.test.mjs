@@ -518,3 +518,22 @@ test('GET /install-plugin 报告安装状态（不跑命令行也能装）', asy
   // 桌面版用户没有 dsh 命令行，所以这条命令只是"参考"，不能当成安装前提
   assert.match(r.json.command, /dsh plugin .* add github:2132774831\/dsh-nodal-memory/);
 });
+test('GET /memories/:id 带上 metrics（关系图右侧要显示权重/衰减）', async () => {
+  const { holder } = mount();
+  const created = await request(holder, {
+    sub: '/memories',
+    method: 'POST',
+    body: JSON.stringify({ content: '关系图状态小字用的一条记忆', kind: 'work', importance: 'important' }),
+  });
+  assert.equal(created.code, 200);
+  const id = created.json.memory.id;
+
+  const r = await request(holder, { sub: '/memories/' + encodeURIComponent(id) });
+  assert.equal(r.code, 200);
+  assert.ok(r.json.metrics, '要有 metrics');
+  assert.equal(typeof r.json.metrics.weight, 'number');
+  assert.ok(r.json.metrics.weight > 0 && r.json.metrics.weight <= 10, '权重应在合理范围');
+  assert.ok(r.json.metrics.decay > 0 && r.json.metrics.decay <= 1, '刚写的衰减应接近 1');
+  assert.equal(typeof r.json.metrics.searchedCount, 'number');
+  assert.equal(typeof r.json.metrics.pinned, 'boolean');
+});
