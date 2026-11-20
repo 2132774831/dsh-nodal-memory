@@ -166,26 +166,30 @@ Write-Host ('        payload.zip: ' + [math]::Round($zipSize / 1KB, 1) + ' KB')
 # 4. compile the self-extractor
 # --------------------------------------------------------------------------
 Write-Host '[4/5] compiling installer EXE...'
-$cs = Join-Path $Root 'scripts\make-installer.cs'
+$cs = Join-Path $Root 'scripts\make-installer-card.cs'
 $exeOut = Join-Path $work 'setup.exe'
 if (-not (Test-Path $cs)) { Fail "stub source not found: $cs" }
 if (Test-Path $exeOut) { Remove-Item $exeOut -Force }
 
-$args = @(
+# NOTE: never name this $args - that is a PowerShell automatic variable and
+# using Start-Process with it silently produced a broken EXE once. Call csc
+# directly with array splatting instead.
+$cscArgs = @(
     '/nologo',
-    '/target:exe',
+    '/target:winexe',
+    ('/win32icon:' + (Join-Path $Root 'assets\icon.ico')),
     '/optimize+',
     ('/out:' + $exeOut),
     ('/resource:' + $zipPath + ',payload.zip'),
     '/r:System.IO.Compression.FileSystem.dll',
     '/r:System.IO.Compression.dll',
     '/r:System.Windows.Forms.dll',
+    '/r:System.Drawing.dll',
     $cs
 )
-$proc = Start-Process -FilePath $csc -ArgumentList $args -Wait -PassThru -NoNewWindow
-if ($proc.ExitCode -ne 0 -or -not (Test-Path $exeOut)) {
-    Fail ('csc failed with exit code ' + $proc.ExitCode)
-}
+& $csc @cscArgs
+if ($LASTEXITCODE -ne 0) { Fail ('csc failed with exit code ' + $LASTEXITCODE) }
+if (-not (Test-Path $exeOut)) { Fail 'csc reported success but produced no EXE' }
 
 # --------------------------------------------------------------------------
 # 5. publish

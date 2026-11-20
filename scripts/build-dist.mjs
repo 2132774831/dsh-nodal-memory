@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = path.join(ROOT, 'dist');
 const NAME = 'dsh-local-memory';
-const VERSION = '2.11.0';                 // 发行版用 v2 的入口（工作区那份仍指向 v1，等主人点头）
+const VERSION = '2.11.2';                 // 发行版用 v2 的入口（工作区那份仍指向 v1，等主人点头）
 const STAGE = path.join(DIST, NAME);
 const ZIP = path.join(DIST, `${NAME}-v${VERSION}-win-x64.zip`);
 
@@ -41,6 +41,10 @@ const ITEMS = [
   ['cordis.patch.yml', 'cordis.patch.yml'],
   ['README.md', 'README.md'],
   ['LICENSE', 'LICENSE'],
+  ['assets/icon.ico', 'icon.ico'],
+  // 安装卡片点完按钮后要调的动作脚本（下载 MCP / 装进 DSH）
+  ['scripts/post-install.mjs', 'scripts/post-install.mjs'],
+  ['scripts/make-shortcut.ps1', 'scripts/make-shortcut.ps1'],
 ];
 for (const [from, to] of ITEMS) {
   const src = path.join(ROOT, from);
@@ -68,12 +72,43 @@ if (!csc) throw new Error('找不到 .NET 编译器 csc.exe，无法生成 Local
 execFileSync(csc, [
   '/nologo',
   '/target:winexe',
+  '/win32icon:' + path.join(ROOT, 'assets', 'icon.ico'),
   '/optimize+',
   '/out:' + path.join(STAGE, 'LocalMemory.exe'),
   '/r:System.Windows.Forms.dll',
   path.join(ROOT, 'scripts', 'make-launcher.cs'),
 ], { stdio: 'inherit' });
 log('  LocalMemory.exe 已编译（无窗口启动器）');
+
+/* ── 1c. 编译原生窗口版 MemoryApp.exe（WebView2）──
+ * 用户要的是"像大厂软件那样"的独立窗口，不是弹个浏览器。
+ * 这里把同一个界面塞进 WebView2 窗口：没有地址栏、没有标签页。
+ * WebView2 运行时 Win10/11 普遍自带，我们只带三个 DLL。 */
+const wv2Dir = path.join(ROOT, 'vendor', 'webview2');
+const wv2Core = path.join(wv2Dir, 'Microsoft.Web.WebView2.Core.dll');
+const wv2Forms = path.join(wv2Dir, 'Microsoft.Web.WebView2.WinForms.dll');
+const wv2Loader = path.join(wv2Dir, 'WebView2Loader.dll');
+const appWindowSrc = path.join(ROOT, 'scripts', 'make-app-window.cs');
+if (fs.existsSync(wv2Core) && fs.existsSync(wv2Forms) && fs.existsSync(appWindowSrc)) {
+  execFileSync(csc, [
+    '/nologo',
+    '/target:winexe',
+    '/win32icon:' + path.join(ROOT, 'assets', 'icon.ico'),
+    '/optimize+',
+    '/out:' + path.join(STAGE, 'MemoryApp.exe'),
+    '/r:System.Windows.Forms.dll',
+    '/r:System.Drawing.dll',
+    '/r:' + wv2Core,
+    '/r:' + wv2Forms,
+    appWindowSrc,
+  ], { stdio: 'inherit' });
+  fs.copyFileSync(wv2Core, path.join(STAGE, 'Microsoft.Web.WebView2.Core.dll'));
+  fs.copyFileSync(wv2Forms, path.join(STAGE, 'Microsoft.Web.WebView2.WinForms.dll'));
+  if (fs.existsSync(wv2Loader)) fs.copyFileSync(wv2Loader, path.join(STAGE, 'WebView2Loader.dll'));
+  log('  MemoryApp.exe 已编译（原生窗口 + WebView2 依赖）');
+} else {
+  log('  ⚠ 跳过 MemoryApp.exe：缺少 vendor/webview2 依赖');
+}
 
 /* ── 2. 改写 package.json：发行版入口指向 v2 ── */
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
@@ -125,9 +160,13 @@ $ErrorActionPreference = 'Stop'
 try {
   # Prefer the GUI launcher: it starts the server with no console window.
   # start.cmd is kept as a fallback (debugging / machines where the exe is gone).
+  # 优先原生窗口版（MemoryApp.exe）：有独立窗口，不像浏览器
+  $appWin = Join-Path $Root 'MemoryApp.exe'
   $exe = Join-Path $Root 'LocalMemory.exe'
   $cmd = Join-Path $Root 'start.cmd'
-  if (Test-Path -LiteralPath $exe) {
+  if (Test-Path -LiteralPath $appWin) {
+    $target = $appWin
+  } elseif (Test-Path -LiteralPath $exe) {
     $target = $exe
   } elseif (Test-Path -LiteralPath $cmd) {
     $target = $cmd
@@ -146,21 +185,14 @@ try {
   $lnk.TargetPath = $target
   $lnk.Arguments = ''
   $lnk.WorkingDirectory = $Root
-  $lnk.IconLocation = "$env:SystemRoot\\System32\\shell32.dll,14"
+  $lnk.IconLocation = (Join-Path $Root "icon.ico")
   $lnk.Description = '本地记忆 — 关系图 / 直觉 / 设置'
   $lnk.Save()
 
-  # 第二个快捷方式：停止后台服务。只有 GUI 启动器支持 --stop。
-  if ($target -eq $exe) {
-    $stopPath = Join-Path $desktop '本地记忆-退出.lnk'
-    $stop = $ws.CreateShortcut($stopPath)
-    $stop.TargetPath = $exe
-    $stop.Arguments = '--stop'
-    $stop.WorkingDirectory = $Root
-    $stop.IconLocation = "$env:SystemRoot\\System32\\shell32.dll,131"
-    $stop.Description = '停止正在后台运行的本记忆服务'
-    $stop.Save()
-  }
+  # 旧的「退出」快捷方式已废弃：现在改用系统托盘图标右键退出，桌面不再放这个链接。
+  # 顺手把老用户桌面上残留的那一个删掉（否则是个点击无效的死链接）。
+  $legacyStop = Join-Path $desktop '本地记忆-退出.lnk'
+  if (Test-Path -LiteralPath $legacyStop) { Remove-Item -LiteralPath $legacyStop -Force -ErrorAction SilentlyContinue }
 
   # 回读校验：不看返回值，只认文件真的在
   if (Test-Path -LiteralPath $lnkPath) {
