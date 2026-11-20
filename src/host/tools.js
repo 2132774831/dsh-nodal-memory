@@ -9,6 +9,9 @@
  *   - memory_review 额外报 kind=unknown 的数量——迁移来的老数据需要补标。
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import { search as coreSearch } from '../core/search.js';
 import { expandByGraph } from '../core/expand.js';
 import { formatRelative, toMs } from '../core/time.js';
@@ -280,6 +283,9 @@ export function buildTools(deps) {
           kind,
           importance: args.importance,
           source: 'tool',
+          // 记下"这条是哪场对话写的"。exec.agent.id 就是会话 id，
+          // 以后检索命中时可以顺着它把同一场对话的其它记忆一起捞出来。
+          sessionId: (exec && exec.agent && exec.agent.id) || null,
         });
         // 配了 embedding 就顺手算向量。失败静默——能不能存下记忆，
         // 不该取决于外部向量服务活着没有。
@@ -486,5 +492,97 @@ export function buildTools(deps) {
         return lines.join('\n');
       },
     }),
+      defineTool({
+        name: 'image_search',
+        description:
+          '在本地图片库里找图片（图片独立于记忆，不参与记忆检索）。'
+          + '用户说「找一下上次那张图」「把前几天的截图找出来」时用它。'
+          + '可以按说明关键词、时间范围、或关联的记忆 id 找。',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: '说明/文件名/标签里的关键词，可不填。' },
+            from: { type: 'string', description: '起始时间（ISO 或 YYYY-MM-DD），可不填。' },
+            to: { type: 'string', description: '结束时间，可不填。' },
+            memoryId: { type: 'string', description: '只看关联到这条记忆的图片。' },
+            limit: { type: 'number', description: '最多返回几张，默认 20。' },
+          },
+        },
+        run: async (args) => {
+          const cfg = getConfig();
+          if (!cfg.enabled) return disabled();
+          const store = getStore();
+          const toMs = (v) => {
+            if (!v) return null;
+            const t = Date.parse(String(v));
+            return Number.isNaN(t) ? null : t;
+          };
+          const rows = store.listMedia({
+            q: String(args.query || '').trim(),
+            from: toMs(args.from),
+            to: toMs(args.to),
+            memoryId: args.memoryId ? String(args.memoryId) : null,
+            limit: Math.min(100, Math.max(1, Number(args.limit) || 20)),
+          });
+          if (!rows.length) return '图片库里没有符合条件的图片。';
+          const dir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'media');
+          return rows.map((m, i) => {
+            const when = new Date(m.createdAt).toLocaleString();
+            const abs = path.join(dir, m.file);
+            return `${i + 1}. [${when}] ${m.note || m.name || '（没写说明）'}\n   id=${m.id}\n   文件=${abs}`
+              + (m.memoryId ? `\n   关联记忆=${m.memoryId}` : '');
+          }).join('\n\n');
+        },
+      }),
+
+      defineTool({
+        name: 'image_save',
+        description:
+          '把本机的一张图片存进图片库（独立于记忆，之后可用 image_search 找到）。'
+          + '用户给你一个图片路径、或明确说"这张图存起来"时用它。',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: '本机图片的绝对路径。' },
+            note: { type: 'string', description: '一句话说明这张图是什么（以后靠它找）。' },
+            tags: { type: 'array', items: { type: 'string' }, description: '可选标签。' },
+            memoryId: { type: 'string', description: '可选：关联到某条记忆。' },
+          },
+          required: ['path'],
+        },
+        run: async (args) => {
+          const cfg = getConfig();
+          if (!cfg.enabled) return disabled();
+          const store = getStore();
+          const srcPath = String(args.path || '').trim();
+          if (!srcPath) return '没有给图片路径。';
+          let buf;
+          try { buf = fs.readFileSync(srcPath); } catch (e) { return '读不到这个文件：' + e.message; }
+          if (!buf.length) return '文件是空的。';
+          const ext = (path.extname(srcPath) || '.jpg').toLowerCase();
+          const mime = ext === '.png' ? 'image/png'
+            : ext === '.webp' ? 'image/webp'
+              : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+          const rec0 = store.putMedia({
+            name: path.basename(srcPath),
+            mime,
+            bytes: buf.length,
+            note: args.note ? String(args.note).slice(0, 500) : null,
+            tags: Array.isArray(args.tags) ? args.tags.slice(0, 20) : [],
+            memoryId: args.memoryId || null,
+          });
+          const dir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'media');
+          const fileName = rec0.id + ext;
+          try {
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, fileName), buf);
+          } catch (e) {
+            try { store.purgeMedia(rec0.id); } catch { /* 忽略 */ }
+            return '写文件失败：' + e.message;
+          }
+          store.updateMedia(rec0.id, { file: fileName });
+          return '已存入图片库。id=' + rec0.id + '（以后用 image_search 按说明找）';
+        },
+      }),
   ];
 }

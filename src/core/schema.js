@@ -32,6 +32,7 @@ export const DDL = [
      importance     TEXT    NOT NULL DEFAULT 'important',
      status         TEXT    NOT NULL DEFAULT 'active',
      project        TEXT    NOT NULL DEFAULT '',
+  session_id     TEXT,
      source         TEXT    NOT NULL DEFAULT '',
      tags           TEXT    NOT NULL DEFAULT '[]',
      parent_id      TEXT,
@@ -47,6 +48,7 @@ export const DDL = [
 
   `CREATE INDEX IF NOT EXISTS idx_memory_created  ON memory(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_project  ON memory(project)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_session  ON memory(session_id)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_kind     ON memory(kind)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_deleted  ON memory(deleted_at)`,
 
@@ -67,6 +69,26 @@ export const DDL = [
      status    TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS idx_update_memory ON memory_update(memory_id)`,
+
+  // 独立图片库：只存文件名，实体在 <dataHome>/media/
+  // note/tags/memory_id 让它"到时候翻得到"：按说明搜、按标签筛、按记忆关联。
+  `CREATE TABLE IF NOT EXISTS memory_media (
+     id         TEXT PRIMARY KEY,
+     file       TEXT NOT NULL,
+     name       TEXT,
+     mime       TEXT,
+     bytes      INTEGER,
+     width      INTEGER,
+     height     INTEGER,
+     note       TEXT,
+     tags       TEXT,
+     memory_id  TEXT,
+     created_at TEXT NOT NULL,
+     deleted_at TEXT,
+     schema_version INTEGER NOT NULL DEFAULT 2
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_media_created ON memory_media(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_media_memory  ON memory_media(memory_id)`,
 
   // 键值元信息：schema 版本、上次维护时间、上次体检时间等
   `CREATE TABLE IF NOT EXISTS memory_meta (

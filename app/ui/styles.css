@@ -203,3 +203,43 @@ textarea { resize: vertical; }
   70% { box-shadow: 0 0 0 2px rgba(74, 144, 217, 0.35); }
   100% { box-shadow: none; background: inherit; }
 }
+
+
+/* ── 图片库 ── */
+.mediaGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+  padding: 4px;
+  align-content: start;
+}
+.mediaGrid.dragging {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
+  border-radius: 8px;
+}
+.mediaCard {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+}
+.mediaThumb {
+  width: 100%;
+  height: 130px;
+  object-fit: cover;
+  display: block;
+  cursor: zoom-in;
+  background: #0d0f13;
+}
+.mediaMeta { padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.mediaNote { font-size: 12px; line-height: 1.5; color: var(--text); overflow-wrap: anywhere; }
+.mediaOverlay {
+  position: fixed; inset: 0; z-index: 999;
+  background: rgba(8, 10, 14, 0.92);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; cursor: zoom-out;
+}
+.mediaOverlay img { max-width: 92vw; max-height: 86vh; border-radius: 6px; }

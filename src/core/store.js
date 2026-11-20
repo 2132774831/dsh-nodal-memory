@@ -99,6 +99,8 @@ export function normalizeRecord(input, now = Date.now(), opts = {}) {
     importance: pickEnum(input.importance, ENUMS.importance, 'important'),
     status: pickEnum(input.status, ENUMS.status, 'active'),
     project: String(input.project ?? '').trim(),
+    // 写入时的会话 id：用来把「同一次对话产生的记忆」连成事件
+    sessionId: input.sessionId ? String(input.sessionId) : null,
     source: String(input.source ?? '').trim(),
     tags: normalizeTags(input.tags),
     parentId: input.parentId ? String(input.parentId) : null,
@@ -123,9 +125,34 @@ class SqliteBackend {
     const DatabaseSync = loadSqlite();
     fs.mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
+    // ⚠ 顺序很重要：**先补齐老库缺的列，再跑 DDL**。
+    //   因为 DDL 里有 `CREATE INDEX ... ON memory(session_id)`，
+    //   旧表没这一列时这句会直接抛 "no such column: session_id"，
+    //   整个 openStore 失败 → 老用户升级后软件起不来（真实复现过）。
+    this._ensureColumns();
     for (const sql of DDL) this.db.exec(sql);
     this._prepare();
     this.setMeta('schema_version', String(SCHEMA_VERSION));
+  }
+
+  /** 老库平滑升级：缺哪列补哪列（只做加法，不动已有数据） */
+  _ensureColumns() {
+    let cols = [];
+    try {
+      cols = this.db.prepare('PRAGMA table_info(memory)').all().map((c) => c.name);
+    } catch { return; }
+    // 表还没建 = 全新库，DDL 会带着新列一起建，这里什么都不用做
+    if (!cols.length) return;
+    if (!cols.includes('session_id')) {
+      try {
+        this.db.exec('ALTER TABLE memory ADD COLUMN session_id TEXT');
+      } catch (e) {
+        // 补列失败不能静默：没有这一列，事件功能会悄悄退化成"什么都没有"
+        console.error('[local-memory] 给老库补 session_id 列失败：' + (e && e.message));
+        return;
+      }
+    }
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_memory_session ON memory(session_id)'); } catch { /* 索引可有可无 */ }
   }
 
   _prepare() {
@@ -133,12 +160,12 @@ class SqliteBackend {
     this.stInsert = db.prepare(`INSERT INTO memory
       (id, created_at, updated_at, kind, topic, content, importance, status, project, source,
        tags, parent_id, access_count, injected_count, searched_count, last_accessed, pinned,
-       deleted_at, origin, schema_version)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+       deleted_at, origin, schema_version, session_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     this.stUpdate = db.prepare(`UPDATE memory SET
        created_at=?, updated_at=?, kind=?, topic=?, content=?, importance=?, status=?, project=?,
        source=?, tags=?, parent_id=?, access_count=?, injected_count=?, searched_count=?,
-       last_accessed=?, pinned=?, deleted_at=?, origin=?, schema_version=?
+       last_accessed=?, pinned=?, deleted_at=?, origin=?, schema_version=?, session_id=?
        WHERE id=?`);
     this.stFtsInsert = db.prepare('INSERT INTO memory_fts(rowid, content_big, topic_big, tags_big) VALUES (?,?,?,?)');
     this.stFtsDelete = db.prepare('DELETE FROM memory_fts WHERE rowid=?');
@@ -167,6 +194,9 @@ class SqliteBackend {
       rec.project, rec.source, JSON.stringify(rec.tags), rec.parentId, rec.accessCount,
       rec.injectedCount, rec.searchedCount, iso(rec.lastAccessed), rec.pinned, iso(rec.deletedAt),
       rec.origin, rec.schemaVersion,
+      // ⚠ 位置必须和 INSERT/UPDATE 的列顺序严格一致，否则时间戳会被写串。
+      //   session_id 是**追加在最后**的一列，前面 19 个位置一个都没动。
+      rec.sessionId ?? null,
     ];
     let rid;
     if (existing) {
@@ -212,6 +242,26 @@ class SqliteBackend {
       .map((r) => ({ id: r.uid, at: r.at, text: r.text, status: r.status ?? null }));
   }
 
+  /** 同一次会话产生的其它记忆（事件边的真实来源） */
+  listBySession(sessionId, { limit = 8, excludeId = null } = {}) {
+    if (!sessionId) return [];
+    const rows = this.db.prepare(
+      'SELECT * FROM memory WHERE session_id=? AND deleted_at IS NULL ORDER BY created_at ASC LIMIT ?'
+    ).all(String(sessionId), Math.max(1, Math.min(50, Number(limit) || 8)));
+    return rows.map((r) => this._toRecord(r)).filter((r) => r.id !== excludeId);
+  }
+
+  /** 时间上挨着的记忆（老数据没有 session_id，只能推断；调用方要标记"推断"并降权） */
+  listNear(ms, windowMs, { limit = 8, excludeId = null } = {}) {
+    if (!Number.isFinite(Number(ms))) return [];
+    const from = toIso(Number(ms) - Number(windowMs));
+    const to = toIso(Number(ms) + Number(windowMs));
+    const rows = this.db.prepare(
+      'SELECT * FROM memory WHERE deleted_at IS NULL AND created_at >= ? AND created_at <= ? ORDER BY created_at ASC LIMIT ?'
+    ).all(from, to, Math.max(1, Math.min(50, Number(limit) || 8)));
+    return rows.map((r) => this._toRecord(r)).filter((r) => r.id !== excludeId);
+  }
+
   /**
    * 批量取"每条记忆有几条进展"。列表页要显示徽标，但不能为每条记录单独查一次。
    * @returns {Map<string, number>}
@@ -244,6 +294,7 @@ class SqliteBackend {
       status: row.status,
       project: row.project,
       source: row.source,
+      sessionId: row.session_id,
       tags: JSON.parse(row.tags || '[]'),
       parentId: row.parent_id,
       accessCount: row.access_count,
@@ -318,6 +369,110 @@ class SqliteBackend {
     const range = this.db.prepare('SELECT MIN(created_at) a, MAX(created_at) b FROM memory WHERE deleted_at IS NULL').get();
     const neverUsed = this.db.prepare('SELECT COUNT(*) c FROM memory WHERE deleted_at IS NULL AND access_count=0').get().c;
     return { total, deleted, byKind, byImportance, oldest: range.a, newest: range.b, neverUsed };
+  }
+
+  /* ── 图片库 ── */
+  putMedia(input = {}) {
+    const id = input.id || newId();
+    const nowIso = toIso(input.createdAt || Date.now());
+    this.db.prepare(
+      `INSERT OR REPLACE INTO memory_media
+       (id, file, name, mime, bytes, width, height, note, tags, memory_id, created_at, deleted_at, schema_version)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      id,
+      String(input.file || ''),
+      input.name == null ? null : String(input.name),
+      input.mime == null ? null : String(input.mime),
+      Number.isFinite(Number(input.bytes)) ? Number(input.bytes) : null,
+      Number.isFinite(Number(input.width)) ? Number(input.width) : null,
+      Number.isFinite(Number(input.height)) ? Number(input.height) : null,
+      input.note == null ? null : String(input.note),
+      Array.isArray(input.tags) ? JSON.stringify(input.tags) : (input.tags || null),
+      input.memoryId == null ? null : String(input.memoryId),
+      nowIso,
+      null,
+      SCHEMA_VERSION,
+    );
+    return this.getMedia(id);
+  }
+
+  rowToMedia(row) {
+    if (!row) return null;
+    let tags = [];
+    try { tags = row.tags ? JSON.parse(row.tags) : []; } catch { tags = []; }
+    return {
+      id: row.id,
+      file: row.file,
+      name: row.name,
+      mime: row.mime,
+      bytes: row.bytes,
+      width: row.width,
+      height: row.height,
+      note: row.note,
+      tags,
+      memoryId: row.memory_id,
+      createdAt: toMs(row.created_at),
+      deletedAt: row.deleted_at ? toMs(row.deleted_at) : null,
+    };
+  }
+
+  getMedia(id) {
+    const row = this.db.prepare('SELECT * FROM memory_media WHERE id=?').get(id);
+    return this.rowToMedia(row);
+  }
+
+  listMedia({ q = '', from = null, to = null, memoryId = null, limit = 100, offset = 0, includeDeleted = false } = {}) {
+    const where = [];
+    const args = [];
+    if (!includeDeleted) where.push('deleted_at IS NULL');
+    if (memoryId) { where.push('memory_id = ?'); args.push(String(memoryId)); }
+    if (from) { where.push('created_at >= ?'); args.push(toIso(from)); }
+    if (to) { where.push('created_at <= ?'); args.push(toIso(to)); }
+    if (q) {
+      // 说明 / 文件名 / 标签 里包含就算命中（图片库不做分词，够用且可预期）
+      where.push('(COALESCE(note,\'\') LIKE ? OR COALESCE(name,\'\') LIKE ? OR COALESCE(tags,\'\') LIKE ?)');
+      const like = '%' + String(q) + '%';
+      args.push(like, like, like);
+    }
+    const sql = 'SELECT * FROM memory_media' + (where.length ? ' WHERE ' + where.join(' AND ') : '')
+      + ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    args.push(Math.max(1, Math.min(500, Number(limit) || 100)), Math.max(0, Number(offset) || 0));
+    return this.db.prepare(sql).all(...args).map((r) => this.rowToMedia(r));
+  }
+
+  updateMedia(id, patch = {}) {
+    const cur = this.getMedia(id);
+    if (!cur) return null;
+    const next = {
+      file: patch.file !== undefined ? patch.file : cur.file,
+      name: patch.name !== undefined ? patch.name : cur.name,
+      mime: patch.mime !== undefined ? patch.mime : cur.mime,
+      note: patch.note !== undefined ? patch.note : cur.note,
+      tags: patch.tags !== undefined ? patch.tags : cur.tags,
+      memoryId: patch.memoryId !== undefined ? patch.memoryId : cur.memoryId,
+    };
+    this.db.prepare(
+      'UPDATE memory_media SET file=?, name=?, mime=?, note=?, tags=?, memory_id=? WHERE id=?'
+    ).run(next.file, next.name, next.mime, next.note,
+      Array.isArray(next.tags) ? JSON.stringify(next.tags) : (next.tags || null),
+      next.memoryId, id);
+    return this.getMedia(id);
+  }
+
+  removeMedia(id, now = Date.now()) {
+    this.db.prepare('UPDATE memory_media SET deleted_at=? WHERE id=? AND deleted_at IS NULL').run(toIso(now), id);
+  }
+
+  purgeMedia(id) {
+    const row = this.db.prepare('SELECT file FROM memory_media WHERE id=?').get(id);
+    this.db.prepare('DELETE FROM memory_media WHERE id=?').run(id);
+    return row ? row.file : null;
+  }
+
+  countMedia({ includeDeleted = false } = {}) {
+    const sql = 'SELECT COUNT(*) AS n FROM memory_media' + (includeDeleted ? '' : ' WHERE deleted_at IS NULL');
+    return this.db.prepare(sql).get().n;
   }
 
   getMeta(k) {
@@ -614,6 +769,25 @@ class JsonBackend {
     return true;
   }
 
+  /* JSON 后端的事件查询 */
+  listBySession(sessionId, { limit = 8, excludeId = null } = {}) {
+    if (!sessionId) return [];
+    return this.list({ limit: 1000 })
+      .filter((r) => r.sessionId === String(sessionId) && r.id !== excludeId)
+      .slice(0, Math.max(1, Math.min(50, Number(limit) || 8)));
+  }
+
+  listNear(ms, windowMs, { limit = 8, excludeId = null } = {}) {
+    const t = Number(ms);
+    if (!Number.isFinite(t)) return [];
+    const lo = t - Number(windowMs);
+    const hi = t + Number(windowMs);
+    return this.list({ limit: 1000 })
+      .filter((r) => r.createdAt >= lo && r.createdAt <= hi && r.id !== excludeId)
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .slice(0, Math.max(1, Math.min(50, Number(limit) || 8)));
+  }
+
   recordAccess(id, mode = 'inject', now = Date.now()) {
     const rec = this.records.get(id);
     if (!rec) return false;
@@ -648,6 +822,73 @@ class JsonBackend {
       newest: times.length ? toIso(times[times.length - 1]) : null,
       neverUsed: live.filter((r) => r.accessCount === 0).length,
     };
+  }
+
+  /* ── 图片库（JSON 兜底后端） ── */
+  putMedia(input = {}) {
+    const id = input.id || newId();
+    const rec = {
+      id,
+      file: String(input.file || ''),
+      name: input.name == null ? null : String(input.name),
+      mime: input.mime == null ? null : String(input.mime),
+      bytes: Number.isFinite(Number(input.bytes)) ? Number(input.bytes) : null,
+      width: Number.isFinite(Number(input.width)) ? Number(input.width) : null,
+      height: Number.isFinite(Number(input.height)) ? Number(input.height) : null,
+      note: input.note == null ? null : String(input.note),
+      tags: Array.isArray(input.tags) ? input.tags : [],
+      memoryId: input.memoryId == null ? null : String(input.memoryId),
+      createdAt: input.createdAt || Date.now(),
+      deletedAt: null,
+    };
+    this.media = this.media || [];
+    this.media.unshift(rec);
+    this.dirty = true;
+    return rec;
+  }
+
+  getMedia(id) {
+    return (this.media || []).find((m) => m.id === id) || null;
+  }
+
+  listMedia({ q = '', from = null, to = null, memoryId = null, limit = 100, offset = 0, includeDeleted = false } = {}) {
+    let rows = (this.media || []).filter((m) => includeDeleted || !m.deletedAt);
+    if (memoryId) rows = rows.filter((m) => m.memoryId === String(memoryId));
+    if (from) rows = rows.filter((m) => m.createdAt >= Number(from));
+    if (to) rows = rows.filter((m) => m.createdAt <= Number(to));
+    if (q) {
+      const needle = String(q);
+      rows = rows.filter((m) => String(m.note || '').includes(needle)
+        || String(m.name || '').includes(needle)
+        || (m.tags || []).some((t) => String(t).includes(needle)));
+    }
+    rows = rows.slice().sort((a, b) => b.createdAt - a.createdAt);
+    return rows.slice(Math.max(0, Number(offset) || 0), Math.max(0, Number(offset) || 0) + Math.max(1, Math.min(500, Number(limit) || 100)));
+  }
+
+  updateMedia(id, patch = {}) {
+    const cur = this.getMedia(id);
+    if (!cur) return null;
+    Object.assign(cur, {
+      file: patch.file !== undefined ? patch.file : cur.file,
+      name: patch.name !== undefined ? patch.name : cur.name,
+      mime: patch.mime !== undefined ? patch.mime : cur.mime,
+      note: patch.note !== undefined ? patch.note : cur.note,
+      tags: patch.tags !== undefined ? patch.tags : cur.tags,
+      memoryId: patch.memoryId !== undefined ? patch.memoryId : cur.memoryId,
+    });
+    this.dirty = true;
+    return cur;
+  }
+
+  removeMedia(id, now = Date.now()) { const m = this.getMedia(id); if (m) { m.deletedAt = now; this.dirty = true; } }
+  purgeMedia(id) {
+    this.media = (this.media || []).filter((m) => m.id !== id);
+    this.dirty = true;
+    return null;
+  }
+  countMedia({ includeDeleted = false } = {}) {
+    return (this.media || []).filter((m) => includeDeleted || !m.deletedAt).length;
   }
 
   getMeta(k) { return this.meta.get(k) ?? null; }

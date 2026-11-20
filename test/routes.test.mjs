@@ -65,12 +65,18 @@ function makeReq({ url, method = 'GET', body }) {
 }
 
 function makeRes() {
-  const state = { code: 0, headers: {}, body: '' };
+  const state = { code: 0, headers: {}, body: '', chunks: [] };
   const res = {
     set statusCode(v) { state.code = v; },
     get statusCode() { return state.code; },
     writeHead(code, headers) { state.code = code; state.headers = headers || {}; },
-    end(chunk) { if (chunk) state.body += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk); },
+    end(chunk) {
+      if (!chunk) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+      // 图片这类二进制响应必须留原始字节：只留 utf8 字符串的话，比对永远失败
+      state.chunks.push(Buffer.from(buf));
+      state.body += buf.toString('utf8');
+    },
   };
   return { res, state };
 }
@@ -82,7 +88,7 @@ async function request(holder, { method = 'GET', sub = '/state', body } = {}) {
   await holder.spec.handler(req, res);
   let json = null;
   try { json = state.body ? JSON.parse(state.body) : null; } catch { /* 可能是纯文本 */ }
-  return { code: state.code, headers: state.headers, body: state.body, json };
+  return { code: state.code, headers: state.headers, body: state.body, json, raw: Buffer.concat(state.chunks) };
 }
 
 // ---------------------------------------------------------------- 基础
@@ -536,4 +542,58 @@ test('GET /memories/:id 带上 metrics（关系图右侧要显示权重/衰减�
   assert.ok(r.json.metrics.decay > 0 && r.json.metrics.decay <= 1, '刚写的衰减应接近 1');
   assert.equal(typeof r.json.metrics.searchedCount, 'number');
   assert.equal(typeof r.json.metrics.pinned, 'boolean');
+});
+/* ─────────── 图片库（独立于记忆） ─────────── */
+
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+test('图片库：上传 → 列表 → 取图 → 改说明 → 删除', async () => {
+  const { holder } = mount();
+
+  // 1) 上传
+  const up = await request(holder, {
+    sub: '/media',
+    method: 'POST',
+    body: JSON.stringify({ dataUrl: 'data:image/png;base64,' + TINY_PNG, name: 'dot.png', note: '一个像素' }),
+  });
+  assert.equal(up.code, 200);
+  assert.ok(up.json.media && up.json.media.id, '要返回 media.id');
+  const id = up.json.media.id;
+
+  // 2) 列表
+  const list = await request(holder, { sub: '/media' });
+  assert.equal(list.code, 200);
+  assert.equal(list.json.media.length, 1);
+  assert.equal(list.json.media[0].note, '一个像素');
+
+  // 3) 取原图（字节要和上传的一致）
+  const bin = await request(holder, { sub: '/media/' + encodeURIComponent(id) + '/file' });
+  assert.equal(bin.code, 200);
+  assert.match(bin.headers['Content-Type'], /image\/png/);
+  assert.equal(Buffer.from(TINY_PNG, 'base64').equals(bin.raw), true, '取回的字节应与上传一致');
+
+  // 4) 改说明
+  const upd = await request(holder, {
+    sub: '/media/' + encodeURIComponent(id),
+    method: 'POST',
+    body: JSON.stringify({ note: '改过的说明', tags: ['demo'] }),
+  });
+  assert.equal(upd.code, 200);
+  assert.equal(upd.json.media.note, '改过的说明');
+
+  // 5) 彻底删（连文件）
+  const del = await request(holder, { sub: '/media/' + encodeURIComponent(id) + '?purge=1', method: 'DELETE' });
+  assert.equal(del.code, 200);
+  const after = await request(holder, { sub: '/media' });
+  assert.equal(after.json.media.length, 0);
+  const gone = await request(holder, { sub: '/media/' + encodeURIComponent(id) + '/file' });
+  assert.equal(gone.code, 404, '删了以后取图应该 404');
+});
+
+test('图片库：没图时返回空列表，不报错', async () => {
+  const { holder } = mount();
+  const r = await request(holder, { sub: '/media' });
+  assert.equal(r.code, 200);
+  assert.equal(r.json.media.length, 0);
+  assert.equal(r.json.total, 0);
 });

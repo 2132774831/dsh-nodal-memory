@@ -82,6 +82,21 @@ function serveStatic(res, file) {
   res.end(data);
 }
 
+// ── 图片库：文件放哪 ──
+function mediaDir() {
+  return path.join(dshHome(), 'media');
+}
+
+function extForMime(mime) {
+  const m = String(mime || '').toLowerCase();
+  if (m.includes('png')) return '.png';
+  if (m.includes('webp')) return '.webp';
+  if (m.includes('gif')) return '.gif';
+  if (m.includes('bmp')) return '.bmp';
+  if (m.includes('svg')) return '.svg';
+  return '.jpg';
+}
+
 // ── 开机自启动 ──
 // 用 Windows 启动文件夹放一个 .lnk，而不是写注册表：
 // 用户能自己看见、自己删，出问题不会留下一堆看不懂的注册表项。
@@ -555,6 +570,129 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
         const result = runMaintenance(store, { force: true });
         return sendJson(res, 200, { ok: true, result, info: maintenanceInfo(store) });
       }
+
+    /* ══════════ 图片库 ══════════
+     * 独立于记忆：不进检索、不参与打分。
+     * 用户说"找一下上次那张图"时，按时间/说明/关联记忆翻出来。
+     * 实体文件放 <dataHome>/media/，库里只存文件名（库要能随手备份）。 */
+    if (parts[0] === 'media') {
+      // 原图
+      if (parts.length === 3 && parts[2] === 'file' && method === 'GET') {
+        const rec = store.getMedia(parts[1]);
+        if (!rec || rec.deletedAt) { res.writeHead(404); res.end(); return; }
+        const abs = path.join(mediaDir(), rec.file);
+        let data;
+        try { data = fs.readFileSync(abs); } catch { res.writeHead(404); res.end(); return; }
+        res.writeHead(200, {
+          'Content-Type': rec.mime || 'application/octet-stream',
+          'Cache-Control': 'private, max-age=86400',
+          'Content-Length': String(data.length),
+        });
+        res.end(data);
+        return;
+      }
+
+      // 列表
+      if (parts.length === 1 && method === 'GET') {
+        const mq = query.q || '';
+        const list = store.listMedia({
+          q: mq,
+          from: query.from ? Number(query.from) : null,
+          to: query.to ? Number(query.to) : null,
+          memoryId: query.memoryId || null,
+          limit: parseInt_(query.limit, 100, 1, 500),
+          offset: parseInt_(query.offset, 0, 0, 100000),
+          includeDeleted: query.includeDeleted === '1',
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          total: store.countMedia(),
+          count: list.length,
+          media: list,
+          dir: mediaDir(),
+        });
+      }
+
+      // 单张元数据
+      if (parts.length === 2 && method === 'GET') {
+        const rec = store.getMedia(parts[1]);
+        if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
+        return sendJson(res, 200, { ok: true, media: rec });
+      }
+
+      // 上传
+      if (parts.length === 1 && method === 'POST') {
+        const raw = await readBody(req, 12 * 1024 * 1024);
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'body 不是 JSON' }); }
+
+        let b64 = String(body.dataUrl || body.base64 || '');
+        let mime = String(body.mime || '');
+        const m = b64.match(/^data:([^;,]+);base64,(.*)$/s);
+        if (m) { mime = mime || m[1]; b64 = m[2]; }
+        b64 = b64.replace(/\s+/g, '');
+        if (!b64) return sendJson(res, 400, { ok: false, error: '没有图片数据' });
+
+        let buf;
+        try { buf = Buffer.from(b64, 'base64'); } catch { buf = null; }
+        if (!buf || !buf.length) return sendJson(res, 400, { ok: false, error: 'base64 解不开' });
+        if (buf.length > 12 * 1024 * 1024) return sendJson(res, 413, { ok: false, error: '图片超过 12MB' });
+
+        const rec0 = store.putMedia({
+          name: body.name == null ? null : String(body.name),
+          mime: mime || 'image/jpeg',
+          bytes: buf.length,
+          width: Number.isFinite(Number(body.width)) ? Number(body.width) : null,
+          height: Number.isFinite(Number(body.height)) ? Number(body.height) : null,
+          note: body.note == null ? null : String(body.note).slice(0, 500),
+          tags: Array.isArray(body.tags) ? body.tags.slice(0, 20) : [],
+          memoryId: body.memoryId || null,
+        });
+
+        const ext = extForMime(mime);
+        const fileName = rec0.id + ext;
+        try {
+          const dir = mediaDir();
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, fileName), buf);
+        } catch (e) {
+          try { store.purgeMedia(rec0.id); } catch { /* 忽略 */ }
+          return sendJson(res, 500, { ok: false, error: '写文件失败：' + e.message });
+        }
+        const saved = store.updateMedia(rec0.id, { file: fileName });
+        return sendJson(res, 200, { ok: true, media: saved });
+      }
+
+      // 改说明 / 标签 / 关联记忆
+      if (parts.length === 2 && method === 'POST') {
+        const raw = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch { body = {}; }
+        const patch = {};
+        if (body.note !== undefined) patch.note = String(body.note).slice(0, 500);
+        if (body.tags !== undefined) patch.tags = Array.isArray(body.tags) ? body.tags.slice(0, 20) : [];
+        if (body.memoryId !== undefined) patch.memoryId = body.memoryId || null;
+        if (body.name !== undefined) patch.name = body.name == null ? null : String(body.name);
+        const rec = store.updateMedia(parts[1], patch);
+        if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
+        return sendJson(res, 200, { ok: true, media: rec });
+      }
+
+      // 删除
+      if (parts.length === 2 && method === 'DELETE') {
+        const rec = store.getMedia(parts[1]);
+        if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
+        if (query.purge === '1') {
+          const fileName = store.purgeMedia(parts[1]);
+          if (fileName) { try { fs.unlinkSync(path.join(mediaDir(), fileName)); } catch { /* 文件可能已不在 */ } }
+          return sendJson(res, 200, { ok: true, purged: true });
+        }
+        store.removeMedia(parts[1]);
+        return sendJson(res, 200, { ok: true });
+      }
+
+      return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+    }
 
       /* GET /memories —— 列表 / 检索 */
       if (parts.length === 1 && parts[0] === 'memories' && method === 'GET') {

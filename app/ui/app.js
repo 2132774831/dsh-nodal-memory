@@ -2225,10 +2225,177 @@ function renderSettings() {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * 图片库
+ * 独立于记忆：不参与检索打分。用户说"找一下上次那张图"时按时间/说明翻。
+ * ══════════════════════════════════════════════════════════════════════ */
+
+function renderMedia() {
+  const view = document.getElementById('view');
+  view.innerHTML = `
+    <div class="bar">
+      <button class="btn btn--primary" id="mAdd">选择图片</button>
+      <input type="file" id="mFile" accept="image/*" multiple style="display:none" />
+      <input type="search" id="mQ" placeholder="搜说明 / 文件名 / 标签" style="width:240px" maxlength="100" />
+      <button class="btn" id="mAll">全部时间</button>
+      <button class="btn" id="m7">最近 7 天</button>
+      <button class="btn" id="m30">最近 30 天</button>
+      <span class="stat" id="mStat"></span>
+    </div>
+    <div class="hint" style="margin:2px 0 6px">
+      也可以把图片直接拖进来，或在页面里 Ctrl+V 粘贴。图片不进记忆检索，只在这里按时间/说明找。
+    </div>
+    <div class="mediaGrid scroll" id="mGrid"></div>`;
+
+  const grid = document.getElementById('mGrid');
+  const stat = document.getElementById('mStat');
+  const qEl = document.getElementById('mQ');
+  const fileEl = document.getElementById('mFile');
+
+  let since = null;   // 时间筛选（毫秒）
+  let editingNote = null;
+
+  const fmtSize = (n) => {
+    if (!n) return '';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  };
+
+  async function load() {
+    stat.textContent = '读取中…';
+    const params = new URLSearchParams({ limit: '200' });
+    if (qEl.value.trim()) params.set('q', qEl.value.trim());
+    if (since) params.set('from', String(since));
+    try {
+      const data = await api('/media?' + params.toString());
+      const rows = data.media || [];
+      stat.textContent = '共 ' + data.total + ' 张' + (qEl.value.trim() ? ' · 命中 ' + rows.length : '');
+      if (!rows.length) {
+        grid.innerHTML = '<div class="empty">还没有图片。点「选择图片」，或直接拖进来。</div>';
+        return;
+      }
+      grid.innerHTML = rows.map((m) => {
+        const src = API + '/media/' + encodeURIComponent(m.id) + '/file?v=' + (m.createdAt || 0);
+        const when = new Date(m.createdAt).toLocaleString();
+        const isEditing = editingNote === m.id;
+        return `<div class="mediaCard" data-id="${esc(m.id)}">
+          <img class="mediaThumb" src="${esc(src)}" alt="${esc(m.note || m.name || '')}" loading="lazy" />
+          <div class="mediaMeta">
+            <div class="mediaNote">${isEditing
+              ? `<textarea data-note="${esc(m.id)}" rows="2" style="width:100%"></textarea>
+                 <div class="itemActions"><button class="btn btn--primary" data-save="${esc(m.id)}">保存</button>
+                 <button class="btn" data-cancel="${esc(m.id)}">取消</button></div>`
+              : esc(m.note || '（没写说明）')}</div>
+            <div class="hint">${esc(when)} · ${esc(fmtSize(m.bytes))}${m.width ? ' · ' + m.width + '×' + m.height : ''}</div>
+            <div class="itemActions">
+              <button class="btn" data-edit="${esc(m.id)}">改说明</button>
+              <button class="btn btn--danger" data-del="${esc(m.id)}">删除</button>
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+      // 编辑态的 textarea 回填原值（不能塞在模板里，否则 HTML 转义麻烦）
+      for (const ta of grid.querySelectorAll('textarea[data-note]')) {
+        const id = ta.dataset.note;
+        const m = rows.find((r) => r.id === id);
+        if (m) ta.value = m.note || '';
+      }
+    } catch (err) {
+      stat.textContent = '读取失败：' + err.message;
+    }
+  }
+
+  async function upload(fileList) {
+    const files = Array.from(fileList || []).filter((f) => /^image\//.test(f.type));
+    if (!files.length) return;
+    stat.textContent = '上传中…（' + files.length + ' 张）';
+    for (const f of files) {
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(String(fr.result));
+          fr.onerror = () => reject(new Error('读取失败'));
+          fr.readAsDataURL(f);
+        });
+        await api('/media', {
+          method: 'POST',
+          body: JSON.stringify({ dataUrl, name: f.name, note: '', tags: [] }),
+        });
+      } catch (err) {
+        toast('「' + f.name + '」上传失败：' + err.message, true);
+      }
+    }
+    toast('已存入图片库');
+    await load();
+  }
+
+  document.getElementById('mAdd').onclick = () => fileEl.click();
+  fileEl.onchange = () => { upload(fileEl.files); fileEl.value = ''; };
+  document.getElementById('mAll').onclick = () => { since = null; load(); };
+  document.getElementById('m7').onclick = () => { since = Date.now() - 7 * 86400000; load(); };
+  document.getElementById('m30').onclick = () => { since = Date.now() - 30 * 86400000; load(); };
+  qEl.addEventListener('input', () => { clearTimeout(qEl._t); qEl._t = setTimeout(load, 250); });
+
+  // 拖拽上传
+  grid.addEventListener('dragover', (ev) => { ev.preventDefault(); grid.classList.add('dragging'); });
+  grid.addEventListener('dragleave', () => grid.classList.remove('dragging'));
+  grid.addEventListener('drop', (ev) => {
+    ev.preventDefault();
+    grid.classList.remove('dragging');
+    upload(ev.dataTransfer && ev.dataTransfer.files);
+  });
+
+  // 粘贴上传（只在这个页签生效）
+  const onPaste = (ev) => {
+    const items = (ev.clipboardData && ev.clipboardData.items) || [];
+    const files = [];
+    for (const it of items) {
+      if (it.type && it.type.startsWith('image/')) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) { ev.preventDefault(); upload(files); }
+  };
+  document.addEventListener('paste', onPaste);
+
+  // 点缩略图看大图
+  grid.addEventListener('click', (ev) => {
+    const img = ev.target.closest('.mediaThumb');
+    if (img) {
+      const big = document.createElement('div');
+      big.className = 'mediaOverlay';
+      big.innerHTML = '<img src="' + img.src + '" alt="" /><div class="hint">点任意处关闭</div>';
+      big.onclick = () => big.remove();
+      document.body.appendChild(big);
+      return;
+    }
+    const id = ev.target.closest('[data-id]') && ev.target.closest('[data-id]').dataset.id;
+    if (!id) return;
+    if (ev.target.closest('[data-edit]')) { editingNote = id; load(); }
+    if (ev.target.closest('[data-cancel]')) { editingNote = null; load(); }
+    if (ev.target.closest('[data-save]')) {
+      const ta = grid.querySelector('textarea[data-note="' + id + '"]');
+      api('/media/' + encodeURIComponent(id), { method: 'POST', body: JSON.stringify({ note: ta ? ta.value : '' }) })
+        .then(() => { editingNote = null; toast('说明已保存'); load(); })
+        .catch((err) => toast('保存失败：' + err.message, true));
+    }
+    if (ev.target.closest('[data-del]')) {
+      if (!confirm('删除这张图片？（不可恢复）')) return;
+      api('/media/' + encodeURIComponent(id) + '?purge=1', { method: 'DELETE' })
+        .then(() => { toast('已删除'); load(); })
+        .catch((err) => toast('删除失败：' + err.message, true));
+    }
+  });
+
+  load();
+  return () => document.removeEventListener('paste', onPaste);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * 外壳
  * ══════════════════════════════════════════════════════════════════════ */
 
-const TABS = { graph: renderGraph, list: renderList, classify: renderClassify, insight: renderInsight, settings: renderSettings };
+const TABS = { graph: renderGraph, list: renderList, classify: renderClassify, media: renderMedia, insight: renderInsight, settings: renderSettings };
 
 function switchTab(name) {
   if (cleanup) { try { cleanup(); } catch { /* 忽略 */ } cleanup = null; }

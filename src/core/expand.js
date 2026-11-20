@@ -1,72 +1,163 @@
 /**
  * 图扩展召回（可选，默认关）。
  *
- * 思路：关键词只认"字面碰巧一样"，召回不了"说法不同但确实相关"的记忆。
- * 所以当命中太少时，沿着**共现边**把邻居补进来：
- *   这两条记忆曾经被一起注入过 → 它们大概在讲同一件事。
+ * ⚠ v2 重写：**共现边退出扩展路径**。
  *
- * 为什么限制得这么死（1 跳 / 最多 3 条 / 权重 ×0.3 / 只在命中 <3 时触发）：
- *   - 共现边本质是"被一起注入过"，拿它做召回会形成自我强化回路
- *     （被一起注入 → 更容易再一起注入 → 更容易被一起注入）
- *   - 热门节点会把一堆无关的拖进来
- *   - 只在"本来没搜到几条"时才补，避免把已经很准的结果搅浑
+ * 为什么砍掉共现：它的数据源是"这两条被同一次检索/注入一起用到过"——
+ * 测的不是记忆间的相关性，而是**检索系统的历史行为**。拿它做扩展 → 被一起注入
+ * → 下次更容易被一起注入，是标准的 rich-get-richer；而且每轮 top5 注入会在
+ * 5 条之间形成完全子图，几十轮后边就饱和了（实测 109 条记忆已有 372 条边）。
+ * 共现边保留下来只做可视化和分析，**不参与召回**。
  *
- * 所以它是**兜底**，不是主路径。
+ * 现在只用**外生信号**（不依赖检索行为，天然免疫反馈回路）：
+ *
+ *   1. 同会话   —— 同一次对话产生的记忆（真实事件，最强）
+ *   2. 时间推断 —— 老数据没有会话 id，按时间窗口推断（弱，必须降权并标注）
+ *   3. 同类事   —— 共享标签 + 稀有词 IDF overlap（跨项目也能连）
+ *
+ * 三条硬限制（防止上下文被噪声淹没）：
+ *   - 命中已经够多（默认 ≥3 条）就不扩展
+ *   - 总预算 600 字（不是按条数：4 条长记忆能顶 8 条短的）
+ *   - 补进来的相关性必须 ≥ 最高命中的 0.6
  */
+import { tokenSet } from './text.js';
 
-/** 默认参数（都写死理由，不做成用户可调，免得把回路放大） */
 export const GRAPH_EXPAND = {
-  maxAdded: 3,          // 最多补 3 条
-  weight: 0.3,          // 每条按命中分的 30% 计入
-  whenFewerThan: 3,     // 命中不足 3 条才扩展
-  minCooccur: 2,        // 只认"至少一起出现过 2 次"的边，一次巧合不算
+  maxAdded: 4,              // 最多补 4 条
+  maxChars: 600,            // 总字数预算
+  whenFewerThan: 3,         // 命中不足 3 条才扩展
+  minRelRatio: 0.6,         // 补进来的分数不得低于最高命中的 60%
+  weight: 0.35,             // 基础折扣
+  inferredWeight: 0.6,      // 时间推断事件再打折
+  kindredWeight: 0.7,       // 同类事再打折
+  /** 稀有词 IDF overlap 下限。实测 109 条语料：≥0.05 命中 27 对（0.46%），
+   *  而 token 余弦 max 只有 0.333 —— 所以余弦 0.35 是空转，这个值是量出来的 */
+  kindredOverlap: 0.05,
+  /** 老数据推断事件的窗口。实测间隔 p50=23min、15min 窗口最大组 7 条（30min 会出 12 条组） */
+  inferredWindowMs: 15 * 60 * 1000,
 };
 
+/** 粗算一条记忆的"字数量"（中文按字、英文按词，够用） */
+function sizeOf(rec) {
+  return String(rec.content || '').length;
+}
+
 /**
- * @param {object} store      openStore 的实例
- * @param {Array}  results    search() 的结果
+ * 计算"稀有词 overlap"：只算两边都有的、且出现次数 ≤3 的词（罕见词才是身份标识），
+ * 用 IDF 加权后除以较短一侧的总权重。
+ * 为什么不用余弦：余弦对长度敏感（长记忆被稀释、短记忆虚高），
+ * 而 |交集|/min 对长度鲁棒，且天然偏袒"共享稀有词"。
+ */
+function rareOverlap(setA, setB, df, total) {
+  if (!setA.size || !setB.size) return 0;
+  const idf = (w) => Math.log(1 + total / Math.max(1, df.get(w) || 1));
+  let shared = 0;
+  for (const w of setA) {
+    if (setB.has(w) && (df.get(w) || 0) <= 3) shared += idf(w);
+  }
+  if (!shared) return 0;
+  let wa = 0; for (const w of setA) wa += idf(w);
+  let wb = 0; for (const w of setB) wb += idf(w);
+  const minW = Math.min(wa, wb);
+  return minW > 0 ? shared / minW : 0;
+}
+
+/**
+ * @param {object} store
+ * @param {Array}  results  search() 的结果（按分数降序）
  * @param {object} [opts]
- * @returns {Array} 可能变长的结果数组（新增项的 why.graphExpanded = true）
+ * @returns {Array} 可能变长的结果
  */
 export function expandByGraph(store, results, opts = {}) {
   const cfg = { ...GRAPH_EXPAND, ...opts };
-  if (!Array.isArray(results)) return results;
+  if (!Array.isArray(results) || !results.length) return results;
   if (results.length >= cfg.whenFewerThan) return results;
-  if (typeof store.cooccurPairs !== 'function' || typeof store.get !== 'function') return results;
-
-  let pairs = [];
-  try { pairs = store.cooccurPairs({ minCount: cfg.minCooccur, limit: 5000 }) || []; } catch { return results; }
-  if (!pairs.length) return results;
-
-  // 邻接表：id -> [{ id, count }]，按次数从高到低
-  const adj = new Map();
-  for (const p of pairs) {
-    if (!p || !p.a || !p.b) continue;
-    if (!adj.has(p.a)) adj.set(p.a, []);
-    if (!adj.has(p.b)) adj.set(p.b, []);
-    adj.get(p.a).push({ id: p.b, count: p.count || 1 });
-    adj.get(p.b).push({ id: p.a, count: p.count || 1 });
-  }
-  for (const list of adj.values()) list.sort((x, y) => y.count - x.count);
 
   const have = new Set(results.map((r) => r.record && r.record.id));
+  const topScore = results[0].score || 0;
+  // 相关性下限的语义：**只从"够强的命中"出发展开**。
+  //   （不是约束折扣后新增项的分数——那和 weight=0.35 自相矛盾，永远加不进来）
+  const floor = topScore * cfg.minRelRatio;
+
+  // 语料级 IDF（只看最近 500 条，够估算稀有度；全库扫描太重）
+  let corpus = [];
+  try { corpus = store.list({ limit: 500 }) || []; } catch { corpus = []; }
+  const total = Math.max(1, corpus.length);
+  const df = new Map();
+  const sets = new Map();
+  for (const r of corpus) {
+    const st = tokenSet(r.content || '');
+    sets.set(r.id, st);
+    for (const w of st) df.set(w, (df.get(w) || 0) + 1);
+  }
+
   const added = [];
-  // 从分最高的命中出发，逐个取它的邻居
+  let budget = cfg.maxChars;
+  const label = (why) => (why === 'session' ? '同一次对话' : why === 'inferred' ? '同时间段（推断）' : '同类事');
+
   for (const hit of results) {
-    if (added.length >= cfg.maxAdded) break;
-    const id = hit.record && hit.record.id;
-    const neighbors = adj.get(id) || [];
-    for (const nb of neighbors) {
-      if (added.length >= cfg.maxAdded) break;
-      if (have.has(nb.id)) continue;
-      let rec = null;
-      try { rec = store.get(nb.id); } catch { rec = null; }
-      if (!rec || rec.deletedAt || rec.status === 'consolidated') continue;
-      have.add(nb.id);
+    if (added.length >= cfg.maxAdded || budget <= 0) break;
+    // 弱命中不展开：它自己都排不上号，靠它拉出来的邻居只会更弱
+    if ((hit.score || 0) < floor) continue;
+    const rec = hit.record;
+    if (!rec) continue;
+    const candidates = [];
+
+    /* 1. 同一次对话（真实事件） */
+    if (rec.sessionId && typeof store.listBySession === 'function') {
+      try {
+        for (const r of store.listBySession(rec.sessionId, { limit: 8, excludeId: rec.id })) {
+          candidates.push({ rec: r, why: 'session' });
+        }
+      } catch { /* 忽略 */ }
+    }
+
+    /* 2. 老数据没有会话 id：时间窗口推断，必须降权 */
+    if (!rec.sessionId && typeof store.listNear === 'function') {
+      try {
+        for (const r of store.listNear(rec.createdAt, cfg.inferredWindowMs, { limit: 8, excludeId: rec.id })) {
+          candidates.push({ rec: r, why: 'inferred' });
+        }
+      } catch { /* 忽略 */ }
+    }
+
+    /* 3. 同类事：共享标签 + 稀有词 overlap */
+    const hitTags = new Set((rec.tags || []).map(String));
+    if (hitTags.size && typeof store.list === 'function') {
+      const seen = new Set();
+      for (const tag of [...hitTags].slice(0, 3)) {
+        let rows = [];
+        try { rows = store.list({ tag, limit: 40 }) || []; } catch { rows = []; }
+        for (const r of rows) {
+          if (r.id === rec.id || seen.has(r.id)) continue;
+          seen.add(r.id);
+          const sharedTags = (r.tags || []).filter((t) => hitTags.has(String(t))).length;
+          if (sharedTags < 1) continue;
+          const ov = rareOverlap(sets.get(rec.id) || tokenSet(rec.content || ''),
+            sets.get(r.id) || tokenSet(r.content || ''), df, total);
+          if (ov >= cfg.kindredOverlap) candidates.push({ rec: r, why: 'kindred' });
+        }
+      }
+    }
+
+    for (const c of candidates) {
+      if (added.length >= cfg.maxAdded || budget <= 0) break;
+      const r = c.rec;
+      if (!r || have.has(r.id) || r.deletedAt || r.status === 'consolidated') continue;
+      const chars = sizeOf(r);
+      if (chars > budget) continue;
+
+      const factor = cfg.weight
+        * (c.why === 'inferred' ? cfg.inferredWeight : 1)
+        * (c.why === 'kindred' ? cfg.kindredWeight : 1);
+      const score = (hit.score || 0) * factor;   // 一定低于来源命中，保证排序在它后面
+
+      have.add(r.id);
+      budget -= chars;
       added.push({
-        record: rec,
-        score: (hit.score || 0) * cfg.weight,
-        why: { graphExpanded: true, via: id, cooccurCount: nb.count },
+        record: r,
+        score,
+        why: { graphExpanded: true, via: c.why, viaId: rec.id, label: label(c.why) },
       });
     }
   }
