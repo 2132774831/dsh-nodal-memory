@@ -164,10 +164,43 @@ export const EDGE_STYLES = {
   event: { color: 'rgba(120,255,200,0.95)', width: 2.0, dash: null, label: 'AI 认定同一件事' },
 };
 
-export function kindColor(kind) {
-  return KIND_COLORS[kind] || KIND_COLORS.unknown;
+/** 浅色主题的节点颜色：白底上要比深色版深一档才看得清 */
+export const KIND_COLORS_LIGHT = {
+  work: '#3b7fc4',
+  preference: '#c08428',
+  emotion: '#c34a72',
+  unknown: '#8a8f98',
+};
+
+/** 浅色主题的边：白底上要加深、降低透明度 */
+export const EDGE_STYLES_LIGHT = {
+  cooccur: { color: 'rgba(214,120,20,0.80)', width: 2.2, dash: null, label: '共现' },
+  tag: { color: 'rgba(60,110,200,0.50)', width: 1.3, dash: null, label: '共享标签' },
+  semantic: { color: 'rgba(140,90,200,0.55)', width: 1.0, dash: [2, 4], label: '语义相近' },
+  project: { color: 'rgba(70,150,110,0.40)', width: 1.0, dash: null, label: '同项目' },
+  time: { color: 'rgba(120,125,135,0.30)', width: 0.9, dash: [3, 4], label: '时间相邻' },
+  session: { color: 'rgba(200,70,170,0.70)', width: 1.4, dash: null, label: '同一次对话' },
+  kindred: { color: 'rgba(30,150,165,0.55)', width: 1.1, dash: [6, 3], label: '同类事' },
+  event: { color: 'rgba(16,170,120,0.90)', width: 2.0, dash: null, label: 'AI 认定同一件事' },
+};
+
+/** 画布上的其余颜色（标签描边、节点环、卡片底色），按主题取 */
+export const THEME_UI = {
+  dark: { labelStroke: 'rgba(20,22,26,0.9)', labelFill: 'rgba(215,218,224,0.95)', ring: 'rgba(255,255,255,0.9)', cardBg: '#1b1e24', cardText: '#d7dae0', cardMeta: 'rgba(150,156,166,0.95)', cardTitle: '#ffffff' },
+  light: { labelStroke: 'rgba(255,255,255,0.95)', labelFill: 'rgba(30,34,40,0.95)', ring: 'rgba(255,255,255,0.95)', cardBg: '#ffffff', cardText: '#23282a', cardMeta: '#5a626e', cardTitle: '#ffffff' },
+  warm: { labelStroke: 'rgba(250,248,242,0.95)', labelFill: 'rgba(40,36,28,0.95)', ring: 'rgba(250,248,242,0.95)', cardBg: '#ffffff', cardText: '#23282a', cardMeta: '#55605a', cardTitle: '#ffffff' },
+};
+
+/** 按主题拿节点色表 / 边表 */
+export const THEME_KIND = { dark: KIND_COLORS, light: KIND_COLORS_LIGHT, warm: KIND_COLORS_LIGHT };
+export const THEME_EDGE = { dark: EDGE_STYLES, light: EDGE_STYLES_LIGHT, warm: EDGE_STYLES_LIGHT };
+
+export function kindColor(kind, theme = 'dark') {
+  const table = THEME_KIND[theme] || KIND_COLORS;
+  return table[kind] || table.unknown;
 }
 
-export function edgeStyle(kind) {
-  return EDGE_STYLES[kind] || EDGE_STYLES.time;
+export function edgeStyle(kind, theme = 'dark') {
+  const table = THEME_EDGE[theme] || EDGE_STYLES;
+  return table[kind] || table.time;
 }

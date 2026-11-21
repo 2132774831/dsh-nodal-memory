@@ -57,6 +57,8 @@ export const DEFAULTS = {
 
   // 呈现
   injectBrief: true,
+  // 界面主题：dark 深色 / light 纯白 / warm 米白
+  theme: 'dark',
 
   // v2 新增：可选 embedding（默认关闭，失败自动降级到 BM25）
   embedding: {
@@ -233,6 +235,12 @@ export function normalizeConfig(input) {
         if (Number.isFinite(n)) merged[k] = Math.min(3650, Math.max(7, Math.round(n)));
       }
       out.halfLifeDays = merged;
+      continue;
+    }
+
+    if (key === 'theme') {
+      const v = String(value || '');
+      out.theme = ['dark', 'light', 'warm'].includes(v) ? v : DEFAULTS.theme;
       continue;
     }
 

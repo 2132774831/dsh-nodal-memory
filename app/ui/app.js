@@ -8,11 +8,21 @@
 import {
   createLayout, stepLayout, isSettled, bounds,
   kindColor, edgeStyle, KIND_COLORS, EDGE_STYLES,
+  THEME_KIND, THEME_EDGE, THEME_UI,
 } from './core/graph-layout.js';
 
 const API = '/dsh-local-memory';
 
 const KIND_LABELS = { work: '工作', preference: '偏好', emotion: '情感', unknown: '未分类' };
+
+/** 当前主题：dark / light / warm（模块级，顶栏和关系图都要用） */
+let theme = 'dark';
+
+function setDocumentTheme(next) {
+  theme = ['dark', 'light', 'warm'].includes(next) ? next : 'dark';
+  document.documentElement.setAttribute('data-theme', theme);
+  window.dispatchEvent(new CustomEvent('lm-theme', { detail: theme }));
+}
 const IMPORTANCE_LABELS = { key: '关键', important: '重要', casual: '随口', transient: '易过期' };
 const KIND_CHOICES = ['work', 'preference', 'emotion'];
 const IMPORTANCE_CHOICES = ['key', 'important', 'casual', 'transient'];
@@ -21,7 +31,9 @@ const view = document.getElementById('view');
 const toastEl = document.getElementById('toast');
 let cleanup = null;
 /** 关系图渲染模式，写进 URL（#graph/cards），刷新后保持不变 */
-let graphMode = 'dots';
+let graphMode = (() => {
+  try { return localStorage.getItem('lm-view-mode') || 'dots'; } catch { return 'dots'; }
+})();
 
 /* ── 小工具 ── */
 
@@ -110,6 +122,7 @@ function toast(message, isError) {
 async function refreshMeta() {
   try {
     const s = await api('/state');
+    if (s.config && s.config.theme) setDocumentTheme(s.config.theme);
     const kinds = (s.stats.byKind || []).map((k) => (KIND_LABELS[k.kind] || k.kind) + ' ' + k.c).join(' · ');
     document.getElementById('appMeta').textContent =
       `${s.stats.total} 条 · ${s.backend} · ${kinds || '空库'}`
@@ -127,7 +140,11 @@ function renderGraph() {
   view.innerHTML = `
     <div class="bar">
       <input type="search" id="gFilter" placeholder="高亮包含…（正文或标签）" style="width:200px" maxlength="100" />
-      <button class="btn" id="gMode" title="在「圆点图」和「工作流卡片图」之间切换">视图：圆点</button>
+      <select id="gMode" style="width:auto" title="切换显示模式">
+        <option value="dots">圆点图</option>
+        <option value="cards">工作流</option>
+        <option value="outline">线条框</option>
+      </select>
       <button class="btn btn--on" id="gSem" title="语义连线需要 embedding；关掉就不再为图查询花向量调用">语义：开</button>
       <button class="btn" id="gIsolated">孤岛视图：关</button>
       <button class="btn" id="gReload">刷新</button>
@@ -135,7 +152,8 @@ function renderGraph() {
       <button class="btn" id="gFit">适应窗口</button>
       <span class="stat" id="gStats">读取中…</span>
     </div>
-    <div class="graphWrap">
+    <div class="graphWrap" id="gWrap">
+      <button class="sideHandle" id="gHelp" title="展开 / 收起说明">‹</button>
       <div class="canvasBox" id="gBox">
         <canvas id="canvas"></canvas>
         <div class="legend" id="gLegend"></div>
@@ -157,6 +175,9 @@ function renderGraph() {
   let layout = null;
   let viewport = { scale: 1, x: 0, y: 0 };
   let selected = null;
+  /** 卡片分离还在进行（用来在「推完」那一刻再适应一次窗口） */
+  let cardsSettling = false;
+
   let hover = -1;
   let drag = null;
   let raf = 0;
@@ -168,7 +189,7 @@ function renderGraph() {
   let neighborIndex = new Map();
   let isolatedOnly = false;
   let filter = '';
-  let mode = graphMode;       // 'dots' 圆点图 | 'cards' 工作流卡片图
+  let mode = graphMode;       // 'dots' 圆点图 | 'cards' 工作流卡片图 | 'outline' 线条框
   let semanticOn = true;      // 语义连线开关（关掉就不带向量，省查询）
   /** 疑似冲突的记忆 id：关系图上要给它们加黄圈 */
   let conflictIds = new Set();
@@ -181,12 +202,12 @@ function renderGraph() {
   const legendEl = document.getElementById('gLegend');
   function renderLegend() {
     if (!legendEl) return;
-    const kindDots = Object.keys(KIND_COLORS).map((k) => (
-      `<span><i class="dot" style="background:${KIND_COLORS[k]}"></i>${KIND_LABELS[k] || k}</span>`
+    const kindDots = Object.keys(THEME_KIND[theme]).map((k) => (
+      `<span><i class="dot" style="background:${THEME_KIND[theme][k]}"></i>${KIND_LABELS[k] || k}</span>`
     )).join('');
-    if (mode === 'cards') {
-      const lineKinds = Object.keys(EDGE_STYLES).map((k) => {
-        const st = EDGE_STYLES[k];
+    if (mode !== 'dots') {
+      const lineKinds = Object.keys(THEME_EDGE[theme]).map((k) => {
+        const st = THEME_EDGE[theme][k];
         const bg = st.dash
           ? 'repeating-linear-gradient(90deg,#8a8f98 0 3px,transparent 3px 6px)'
           : st.color;
@@ -199,13 +220,27 @@ function renderGraph() {
         + `<span style="opacity:.45">｜</span><span><i class="dot" style="background:#f0c43c"></i>疑似冲突</span>`;
       return;
     }
-    legendEl.innerHTML = Object.keys(EDGE_STYLES).map((k) => {
-      const st = EDGE_STYLES[k];
+    legendEl.innerHTML = Object.keys(THEME_EDGE[theme]).map((k) => {
+      const st = THEME_EDGE[theme][k];
       return `<span><i class="line" style="background:${st.color};height:${Math.max(1, st.width)}px"></i>${st.label}</span>`;
     }).join('') + kindDots
       + `<span style="opacity:.45">｜</span><span><i class="dot" style="background:#f0c43c"></i>疑似冲突</span>`;
   }
+  /** 切主题：改根节点 data-theme，图例和画布跟着重画 */
+  window.addEventListener('lm-theme', () => { renderLegend(); if (layout) draw(); });
+
+  function applyTheme(next) {
+    setDocumentTheme(next);
+    renderLegend();
+    if (layout) draw();
+    // 设置页的主题按钮高亮
+    for (const b of document.querySelectorAll('[data-theme-pick]')) {
+      b.classList.toggle('btn--on', b.dataset.themePick === theme);
+    }
+  }
+
   renderLegend();
+  applyTheme(theme);
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -314,10 +349,11 @@ function renderGraph() {
    */
   function separateCards(L) {
     // 间距给得比卡片本身大不少：挨太近时连线的起止点会糊在一起，完全分不清
-    const gapX = CARD_W + 58;
-    const gapY = CARD_H + 46;
+    const gapX = CARD_W + 26;
+    const gapY = CARD_H + 20;
     let moved = false;
-    for (let iter = 0; iter < 3; iter++) {
+    for (let iter = 0; iter < 4; iter++) {
+      let movedThisPass = false;
       for (let i = 0; i < L.count; i++) {
         for (let j = i + 1; j < L.count; j++) {
           const dx = L.px[j] - L.px[i];
@@ -335,8 +371,10 @@ function renderGraph() {
             L.py[j] += push;
           }
           moved = true;
+          movedThisPass = true;
         }
       }
+      if (!movedThisPass) break;
     }
     return moved;
   }
@@ -377,7 +415,7 @@ function renderGraph() {
     const h = canvas.height / dpr;
     ctx.clearRect(0, 0, w, h);
     if (!layout || layout.count === 0) return;
-    if (mode === 'cards') drawCards();
+    if (mode !== 'dots') drawCards();
     else drawDots();
   }
 
@@ -451,7 +489,7 @@ function renderGraph() {
       const a = layout.ids.get(e.source);
       const b = layout.ids.get(e.target);
       if (a === undefined || b === undefined) continue;
-      const st = edgeStyle(e.kind);
+      const st = edgeStyle(e.kind, theme);
       const [x1, y1] = toScreen(layout.px[a], layout.py[a]);
       const [x2, y2] = toScreen(layout.px[b], layout.py[b]);
       ctx.save();
@@ -487,16 +525,16 @@ function renderGraph() {
       ctx.globalAlpha = dim ? 0.15 : 1;
       if (matched) {
         // 光晕：让命中项在一片点里一眼看出来
-        ctx.shadowColor = kindColor(node.kind);
+        ctx.shadowColor = kindColor(node.kind, theme);
         ctx.shadowBlur = 14 * Math.max(0.6, viewport.scale);
       }
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fillStyle = kindColor(node.kind);
+      ctx.fillStyle = kindColor(node.kind, theme);
       ctx.fill();
       ctx.shadowBlur = 0;
       if (matched) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+        ctx.strokeStyle = THEME_UI[theme].ring;
         ctx.lineWidth = 1.6;
         ctx.stroke();
       }
@@ -523,9 +561,9 @@ function renderGraph() {
         ctx.font = '10px ui-monospace, Consolas, monospace';
         const label = node.label.length > 14 ? node.label.slice(0, 14) + '…' : node.label;
         ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(20,22,26,0.9)';
+        ctx.strokeStyle = THEME_UI[theme].labelStroke;
         ctx.strokeText(label, x + r + 3, y + 3);
-        ctx.fillStyle = 'rgba(215,218,224,0.95)';
+        ctx.fillStyle = THEME_UI[theme].labelFill;
         ctx.fillText(label, x + r + 3, y + 3);
         ctx.restore();
       }
@@ -551,6 +589,9 @@ function renderGraph() {
   /** 工作流视图：卡片式节点 + 贝塞尔连线（像 ComfyUI 那种） */
   function drawCards() {
     const needle = filter.trim().toLowerCase();
+    // 收敛动画期间不画连线：514 条贝塞尔每帧要 20 多毫秒，占了一多半开销，
+    // 这段时间用户看到的是"卡片在动"，连线等停稳再出现完全够用。
+    const settlingFast = layout && !isSettled(layout);
     const scale = viewport.scale;
 
     // 焦点：悬停/选中时只亮它和它的邻居，其余压暗。密集区靠这个才看得清连线归属
@@ -571,8 +612,8 @@ function renderGraph() {
       for (const t of assocTargets(assocIdx)) assocSet.add(layout.nodes[t.i].id);
     }
 
-    // 先画连线（压在卡片下面）
-    for (const e of layout.edges) {
+    // 先画连线（压在卡片下面）；收敛动画期间跳过
+    for (const e of settlingFast ? [] : layout.edges) {
       const a = layout.ids.get(e.source);
       const b = layout.ids.get(e.target);
       if (a === undefined || b === undefined) continue;
@@ -616,10 +657,10 @@ function renderGraph() {
         grad.addColorStop(1, `hsla(${nb.hue}, 72%, 66%, 1)`);
         stroke = grad;
       } else {
-        stroke = edgeStyle(e.kind).color;
+        stroke = edgeStyle(e.kind, theme).color;
       }
 
-      const st = edgeStyle(e.kind);
+      const st = edgeStyle(e.kind, theme);
       ctx.save();
       ctx.globalAlpha = focusId ? (inFocus ? 1 : 0.04) : 0.32;
       ctx.strokeStyle = stroke;
@@ -659,7 +700,7 @@ function renderGraph() {
         || (node.tags || []).some((t) => String(t).toLowerCase().includes(needle))
       );
       const dim = needle && !matched;
-      const accent = kindColor(node.kind);
+      const accent = kindColor(node.kind, theme);
       const headH = Math.min(CARD_HEAD * scale, h * 0.4);
       const inFocus = !focusId || focusSet.has(node.id);
       const isActive = hover === i || (selected && selected.id === node.id);
@@ -669,34 +710,47 @@ function renderGraph() {
       ctx.save();
       ctx.globalAlpha = baseAlpha * focusAlpha;
 
-      // 卡体
+      const isOutline = mode === 'outline';
+      // 卡体：线条框用极淡的底（不填会读不清字），实心用主题底色
       roundRect(x, y, w, h, 6 * scale);
-      ctx.fillStyle = '#1b1e24';
+      ctx.fillStyle = isOutline
+        ? (theme === 'dark' ? 'rgba(20,22,26,0.42)' : 'rgba(255,255,255,0.62)')
+        : THEME_UI[theme].cardBg;
       ctx.fill();
 
-      // 标题栏（按**类别**着色，表示"这是什么"）
-      roundRect(x, y, w, headH, 6 * scale);
-      ctx.fillStyle = accent;
-      ctx.globalAlpha = baseAlpha * focusAlpha * 0.9;
-      ctx.fill();
-      ctx.globalAlpha = baseAlpha * focusAlpha;
+      // 标题栏：实心填类别色块；线条框只画一条 2px 的类别色线
+      if (isOutline) {
+        ctx.fillStyle = accent;
+        ctx.globalAlpha = baseAlpha * focusAlpha * 0.95;
+        ctx.fillRect(x + 1, y + 1, w - 2, Math.max(1.6, 2.2 * scale));
+        ctx.globalAlpha = baseAlpha * focusAlpha;
+      } else {
+        roundRect(x, y, w, headH, 6 * scale);
+        ctx.fillStyle = accent;
+        ctx.globalAlpha = baseAlpha * focusAlpha * 0.9;
+        ctx.fill();
+        ctx.globalAlpha = baseAlpha * focusAlpha;
+      }
 
       // 左侧身份色条（按**记忆 id** 着色，表示"这是哪一条"，和它发出的线同色）
       ctx.fillStyle = `hsla(${node.hue}, 72%, 64%, 0.98)`;
-      ctx.fillRect(x, y + headH, Math.max(1.5, 3.5 * scale), h - headH);
+      ctx.fillRect(x, y + headH, Math.max(1.2, (isOutline ? 2 : 3.5) * scale), h - headH);
 
       // 边框
       roundRect(x, y, w, h, 6 * scale);
       const conflicting = conflictIds.has(node.id);
       const isAssoc = assocSet.has(node.id);
       ctx.strokeStyle = isActive
-        ? 'rgba(255,255,255,0.92)'
+        ? THEME_UI[theme].ring
         : conflicting
           ? 'rgba(240,196,60,0.95)'
           : isAssoc
             ? 'rgba(206,160,255,0.95)'
-            : (focusId && inFocus ? `hsla(${node.hue}, 72%, 64%, 0.8)` : 'rgba(150,155,165,0.32)');
-      ctx.lineWidth = isActive ? 1.8 : ((conflicting || isAssoc) ? 1.8 : 1);
+            : (focusId && inFocus
+              ? `hsla(${node.hue}, 72%, 64%, 0.8)`
+              // 线条框：边框直接用类别色（深色底上也能看出是个框）
+              : (isOutline ? accent : (theme === 'dark' ? 'rgba(150,155,165,0.32)' : 'rgba(60,70,85,0.22)')));
+      ctx.lineWidth = isActive ? 1.8 : ((conflicting || isAssoc) ? 1.8 : (isOutline ? 1.2 : 1));
       ctx.stroke();
 
       // 命中的卡片：加一圈呼吸的蓝色描边 + 光晕（和普通边框区分开）
@@ -741,7 +795,7 @@ function renderGraph() {
       ctx.globalAlpha = (dim ? 0.25 : 1) * focusAlpha;
 
       // 标题
-      ctx.fillStyle = 'rgba(12,14,17,0.92)';
+      ctx.fillStyle = isOutline ? THEME_UI[theme].cardText : THEME_UI[theme].cardTitle;
       ctx.font = `600 ${Math.round(Math.max(8, 11 * scale))}px system-ui, sans-serif`;
       ctx.textBaseline = 'middle';
       const titleY = y + headH / 2;
@@ -761,9 +815,9 @@ function renderGraph() {
       let ry = y + headH + 5 * scale;
       for (const [label, value] of rows) {
         if (ry + rowH > y + h) break;
-        ctx.fillStyle = 'rgba(140,146,156,0.95)';
+        ctx.fillStyle = THEME_UI[theme].cardMeta;
         ctx.fillText(label, x + 7 * scale, ry);
-        ctx.fillStyle = 'rgba(214,218,224,0.95)';
+        ctx.fillStyle = THEME_UI[theme].cardText;
         ctx.fillText(clipText(value, w - 52 * scale), x + 44 * scale, ry);
         ry += rowH;
       }
@@ -775,9 +829,10 @@ function renderGraph() {
     if (stopped) return;
     const dragging = drag && drag.nodeIndex >= 0;
     if (layout && (!isSettled(layout) || dragging)) {
-      // 卡片比圆点大一大截，同样的力会把卡片糊在一起，所以卡片模式用更松的力参数
-      stepLayout(layout, mode === 'cards'
-        ? { repulsion: 22000, springLength: 460, gravity: 0.0022 }
+      // 卡片比圆点大一大截：力参数放宽松；alphaDecay 也调快——
+      // 默认 0.985 要 ~250 帧才收敛，这段时间只有 26 帧/秒，用户会觉得"一卡一卡"。
+      stepLayout(layout, mode !== 'dots'
+        ? { repulsion: 22000, springLength: 460, gravity: 0.0022, alphaDecay: 0.94 }
         : {});
       needsDraw = true;
       if (!dragging && isSettled(layout) && !settledTold) {
@@ -787,8 +842,16 @@ function renderGraph() {
         fitView();
       }
     }
-    // 卡片模式：即使力已收敛也要继续压重叠，否则一收敛就停在"还压着"的状态
-    if (layout && mode === 'cards' && separateCards(layout)) needsDraw = true;
+    // 卡片模式：等力导向收敛后再压重叠（动画期间每帧比对 7750 对太贵，掉帧明显）
+    if (layout && mode !== 'dots' && isSettled(layout)) {
+      if (separateCards(layout)) {
+        needsDraw = true;
+        cardsSettling = true;
+      } else if (cardsSettling) {
+        cardsSettling = false;
+        fitView();
+      }
+    }
     // 过滤框里有词时保持重绘：命中节点要做呼吸动画（清空后自动停，不空转风扇）
     if (filter.trim() && layout && layout.count > 0) needsDraw = true;
     // 收敛且没交互时不再重绘：rAF 空转会让风扇一直转
@@ -806,7 +869,7 @@ function renderGraph() {
     const h = rect.height;
 
     // 卡片模式：点在矩形里就算命中（从后往前找，保证后画的在上层）
-    if (mode === 'cards') {
+    if (mode !== 'dots') {
       const wx = (clientX - rect.left - w / 2) / viewport.scale - viewport.x;
       const wy = (clientY - rect.top - h / 2) / viewport.scale - viewport.y;
       for (let i = layout.count - 1; i >= 0; i--) {
@@ -875,7 +938,7 @@ function renderGraph() {
     const tags = (node.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('');
     el.innerHTML = `
       <div class="nodemenu__head">
-        <span class="tag" style="background:${kindColor(node.kind)}33;border-color:${kindColor(node.kind)}">${esc(KIND_LABELS[node.kind] || node.kind)}</span>
+        <span class="tag" style="background:${kindColor(node.kind, theme)}33;border-color:${kindColor(node.kind, theme)}">${esc(KIND_LABELS[node.kind] || node.kind)}</span>
         <span class="hint">${esc(ageLabel(node.createdAt))}</span>
         ${node.isolated ? '<span class="tag tag--warn">孤岛</span>' : ''}
         <button class="nodemenu__x" title="关闭">✕</button>
@@ -924,8 +987,7 @@ function renderGraph() {
     if (!layout) return;
     const idx = hitTest(ev.clientX, ev.clientY);
     if (idx < 0) { closePopup(); return; }
-    selected = layout.nodes[idx];
-    renderSide();
+    // 右键只弹预览框，不动侧栏（两个一起弹出来太挤）
     showPopup(layout.nodes[idx], ev.clientX, ev.clientY);
   });
 
@@ -937,7 +999,15 @@ function renderGraph() {
   document.addEventListener('pointerdown', onDocPointerDown, true);
   document.addEventListener('keydown', onKeyDown);
 
+  /** 侧栏是否展开：默认收起，点节点或点「帮助」才打开 */
+  let sideOpen = false;
   function renderSide() {
+    side.classList.toggle('hidden', !sideOpen);
+    const wrapEl = document.getElementById('gWrap');
+    if (wrapEl) wrapEl.classList.toggle('side-open', sideOpen);
+    const hEl = document.getElementById('gHelp');
+    if (hEl) hEl.textContent = sideOpen ? '›' : '‹';
+
     if (!selected) {
       side.innerHTML = `<h3>怎么读这张图</h3>
         <div class="hint" style="line-height:1.9">
@@ -948,7 +1018,12 @@ function renderGraph() {
           <b>左键</b>点节点看详情，<b>右键</b>弹窗看全文。<br />
           「视图」按钮可在圆点图 / 工作流卡片图之间切换。<br />
           滚轮缩放，拖空白处平移，拖节点可手动摆位置。
+        </div>
+        <div class="bar" style="margin-top:12px">
+          <button class="btn" id="gHelpClose">关闭</button>
         </div>`;
+      const hc = document.getElementById('gHelpClose');
+      if (hc) hc.onclick = () => { sideOpen = false; renderSide(); };
       return;
     }
     const meta = [
@@ -973,7 +1048,7 @@ function renderGraph() {
         <button class="btn" id="gClose">关闭</button>
       </div>`;
     const close = document.getElementById('gClose');
-    if (close) close.onclick = () => { selected = null; renderSide(); };
+    if (close) close.onclick = () => { selected = null; sideOpen = false; renderSide(); };
     // 侧栏里先把截断标签显示出来（立刻有反馈），再补全文
     const pickedId = selected.id;
     fetchDetail(pickedId).then((d) => {
@@ -1048,20 +1123,21 @@ function renderGraph() {
     pendingFocusId = null;
   }
 
-  function fitView() {
+  function fitView({ allowTiny = false } = {}) {
     if (!layout || layout.count === 0) return;
     const b = bounds(layout);
     const w = box.clientWidth || 640;
     const h = box.clientHeight || 480;
     // 卡片模式的包围盒要把卡片自身的宽高算进去，否则边缘卡片会被切掉一半
-    const padX = mode === 'cards' ? CARD_W : 0;
-    const padY = mode === 'cards' ? CARD_H : 0;
+    const padX = mode !== 'dots' ? CARD_W : 0;
+    const padY = mode !== 'dots' ? CARD_H : 0;
     const spanX = Math.max(1, b.maxX - b.minX + padX);
     const spanY = Math.max(1, b.maxY - b.minY + padY);
     const scale = Math.min((w - 80) / spanX, (h - 80) / spanY);
     // 卡片模式不硬缩到"全部可见"：75 张卡片挤进一屏会小到看不清字。
     // 保底 0.55 倍保证文字可读，装不下的部分靠拖拽/滚轮看——这本来也是工作流图的用法。
-    const minScale = mode === 'cards' ? 0.55 : 0.15;
+    // 卡片模式默认保 0.55 倍（文字才看得清）；点「适应窗口」时允许缩到 0.25 看全貌
+    const minScale = mode !== 'dots' ? (allowTiny ? 0.25 : 0.55) : 0.15;
     viewport.scale = Math.max(minScale, Math.min(3, scale));
     viewport.x = -(b.minX + b.maxX) / 2;
     viewport.y = -(b.minY + b.maxY) / 2;
@@ -1075,6 +1151,7 @@ function renderGraph() {
       drag = { nodeIndex: idx, startX: ev.clientX, startY: ev.clientY };
       if (layout) layout.alpha = Math.max(layout.alpha, 0.6);
       selected = layout.nodes[idx];
+      sideOpen = true;   // 左键点节点：直接把详情栏划出来
       renderSide();
     } else {
       drag = { nodeIndex: -1, startX: ev.clientX, startY: ev.clientY, origin: { ...viewport } };
@@ -1121,14 +1198,12 @@ function renderGraph() {
   });
 
   const modeBtn = document.getElementById('gMode');
-  modeBtn.textContent = mode === 'dots' ? '视图：圆点' : '视图：工作流';
-  modeBtn.classList.toggle('btn--on', mode === 'cards');
-  modeBtn.addEventListener('click', () => {
-    mode = mode === 'dots' ? 'cards' : 'dots';
+  modeBtn.value = mode;
+  modeBtn.addEventListener('change', () => {
+    mode = modeBtn.value;
     graphMode = mode;
     location.hash = 'graph/' + mode;
-    modeBtn.textContent = mode === 'dots' ? '视图：圆点' : '视图：工作流';
-    modeBtn.classList.toggle('btn--on', mode === 'cards');
+    try { localStorage.setItem('lm-view-mode', mode); } catch { /* 存不了就算了 */ }
     closePopup();
     // 卡片比圆点大得多：切过去重新热一下布局，再适应窗口，不然会挤成一坨
     if (layout) layout.alpha = 1;
@@ -1154,7 +1229,13 @@ function renderGraph() {
     if (layout) layout.alpha = 1;
     settledTold = false;
   });
-  document.getElementById('gFit').addEventListener('click', fitView);
+  document.getElementById('gHelp').addEventListener('click', () => {
+  sideOpen = !sideOpen;
+  if (!sideOpen) selected = null;
+  renderSide();
+});
+
+document.getElementById('gFit').addEventListener('click', () => fitView({ allowTiny: true }));
 
   const onResize = () => { resize(); };
   window.addEventListener('resize', onResize);
@@ -1249,13 +1330,13 @@ function renderList() {
                <button class="btn btn--primary" data-act="save">保存</button>
                <button class="btn" data-act="cancel">取消</button>
              </div>`
-          : `<div class="body">${esc(compact(rec.content, 160))}</div>
+          : `<div class="body"><span data-bs>${esc(compact(rec.content, 160))}</span><span data-bf hidden>${esc(rec.content)}</span></div>
              ${rec.updatesCount ? `<div class="meta" style="margin-top:4px">↳ 有 ${rec.updatesCount} 条后续进展</div>` : ''}
              ${tags ? `<div class="meta" style="margin-top:4px">${tags}</div>` : ''}
              <div class="itemActions">
                ${rec.deletedAt
                  ? '<button class="btn" data-act="restore">恢复</button><button class="btn btn--danger" data-act="purge">彻底删除</button>'
-                 : `<button class="btn${rec.pinned ? ' btn--primary' : ''}" data-act="pin" title="钉住后每轮自动回忆都会带上它">${rec.pinned ? '★ 已置顶' : '☆ 置顶'}</button><button class="btn" data-act="progress">追加进展</button><select class="input" data-act="imp" title="手动调权重：关键 > 重要 > 随口 > 易过期" style="width:auto;padding:2px 6px">
+                 : `${rec.content.length > 160 ? '<button class="btn" data-act="expand">展开全文</button>' : ''}<button class="btn${rec.pinned ? ' btn--primary' : ''}" data-act="pin" title="钉住后每轮自动回忆都会带上它">${rec.pinned ? '★ 已置顶' : '☆ 置顶'}</button><button class="btn" data-act="progress">追加进展</button><select class="input" data-act="imp" title="手动调权重：关键 > 重要 > 随口 > 易过期" style="width:auto;padding:2px 6px">
                   ${IMPORTANCE_CHOICES.map((i) => `<option value="${i}"${rec.importance === i ? ' selected' : ''}>${IMPORTANCE_LABELS[i]}</option>`).join('')}
                 </select>
                 <button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>`}
@@ -1285,6 +1366,19 @@ function renderList() {
     const id = item && item.dataset.id;
     if (!id) return;
     const act = btn.dataset.act;
+
+    // 展开/收起全文：只在卡片内切换两个 span，不重新请求
+    if (act === 'expand') {
+      const bs = item.querySelector('[data-bs]');
+      const bf = item.querySelector('[data-bf]');
+      if (bs && bf) {
+        const opening = bf.hasAttribute('hidden');
+        if (opening) { bf.removeAttribute('hidden'); bs.setAttribute('hidden', ''); }
+        else { bf.setAttribute('hidden', ''); bs.removeAttribute('hidden'); }
+        btn.textContent = opening ? '收起' : '展开全文';
+      }
+      return;
+    }
 
     if (act === 'edit') { editing = id; load(queryEl.value); return; }
     if (act === 'cancel') { editing = null; load(queryEl.value); return; }
@@ -1750,6 +1844,21 @@ function renderSettings() {
 
       <div class="item">
         <div class="itemHead">
+          <strong>外观</strong>
+          <span class="hint">界面和关系图一起换，点一下立刻生效</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="label">主题</span>
+          <button class="btn" data-theme-pick="dark">深色</button>
+          <button class="btn" data-theme-pick="light">纯白</button>
+          <button class="btn" data-theme-pick="warm">米白</button>
+        </div>
+        <div class="hint" style="margin-top:6px">纯白＝#fff 底黑字；米白＝偏暖纸色，长时间看不刺眼</div>
+      </div>
+
+
+      <div class="item">
+        <div class="itemHead">
           <strong>语义检索（embedding，可选）</strong>
           <span class="hint" id="sEmbState"></span>
         </div>
@@ -1960,8 +2069,11 @@ function renderSettings() {
         <div class="meta" id="sPaths"></div>
         <div class="row" style="margin-top:8px">
           <button class="btn" id="sExport">导出 Markdown</button>
-          <span class="hint">导出的文件可以用任何编辑器打开，也能带到别的电脑</span>
+          <button class="btn" id="dataImport">从 Markdown 导入…</button>
+          <input type="file" id="dataFile" accept=".md,.markdown,text/markdown,text/plain" style="display:none" />
+          <span class="hint" id="dataResult"></span>
         </div>
+        <div class="hint" style="margin-top:6px">导出的文件可以用任何编辑器打开，也能带到别的电脑</div>
       </div>
     </div>`;
 
@@ -2132,6 +2244,8 @@ function renderSettings() {
         ? `<span>上次维护 ${s.maintenance.lastAgoDays} 天前</span>` : '<span>还没维护过</span>',
     ].join('');
 
+    setDocumentTheme(s.config.theme || 'dark');
+
     const e = s.config.embedding || {};
     $('eEnabled').checked = e.enabled === true;
     $('eBase').value = e.baseUrl || '';
@@ -2235,6 +2349,38 @@ function renderSettings() {
     } catch (err) { $('eResult').textContent = '失败：' + err.message; }
     await load();
   });
+
+  /* 数据：导入（导出按钮的监听在下面既有代码里） */
+  const dataImportBtn = document.getElementById('dataImport');
+  if (dataImportBtn) {
+    const fileInput = document.getElementById('dataFile');
+    dataImportBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const box = document.getElementById('dataResult');
+      box.textContent = '导入中…';
+      try {
+        const text = await file.text();
+        const r = await api('/import', { method: 'POST', body: JSON.stringify({ markdown: text }) });
+        box.textContent = '导入完成：新增 ' + r.created + ' 条' + (r.skipped && r.skipped.length ? ('，跳过 ' + r.skipped.length + ' 条') : '');
+        await refreshMeta();
+      } catch (err) {
+        box.textContent = '导入失败：' + err.message;
+      } finally {
+        fileInput.value = '';
+      }
+    });
+  }
+
+  /* 外观：点一下立刻换，同时写进配置 */
+  for (const tbtn of document.querySelectorAll('[data-theme-pick]')) {
+    tbtn.addEventListener('click', async () => {
+      setDocumentTheme(tbtn.dataset.themePick);
+      try { await api('/config', { method: 'POST', body: JSON.stringify({ theme: tbtn.dataset.themePick }) }); }
+      catch (err) { toast('保存失败：' + err.message, true); }
+    });
+  }
 
   $('fSens').addEventListener('change', async () => {
     try {
@@ -2520,7 +2666,7 @@ document.getElementById('tabs').addEventListener('click', (ev) => {
 // hash 形如 #graph/cards：第一个是页签，第二个是关系图的渲染模式
 const hashParts = (location.hash || '#graph').slice(1).split('/');
 const initialTab = TABS[hashParts[0]] ? hashParts[0] : 'graph';
-if (hashParts[1] === 'cards' || hashParts[1] === 'dots') graphMode = hashParts[1];
+if (['cards', 'dots', 'outline'].includes(hashParts[1])) graphMode = hashParts[1];
 switchTab(initialTab);
 refreshMeta();
 setInterval(refreshMeta, 20000);

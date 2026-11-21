@@ -350,6 +350,45 @@ function parseInt_(value, fallback, lo, hi) {
 }
 
 /** 导出成 Markdown：给人看、给别的 Agent 读、也是跨电脑迁移的通用格式 */
+/**
+ * 解析导出的 Markdown（也可以手写同格式）：
+ *   ## <id> · <date>
+ *   项目 x · 类别 work · 重要度 important · 标签 a, b
+ *   <正文>
+ */
+function parseMarkdownImport(md) {
+  const blocks = String(md).split(/^## /m).slice(1);
+  const out = [];
+  for (const blk of blocks) {
+    const lines = blk.split('\n');
+    const head = (lines.shift() || '').trim();      // id · date
+    let metaLine = '';
+    const body = [];
+    let seenMeta = false;
+    for (const line of lines) {
+      const s = line.trim();
+      if (!seenMeta && s && /(项目|类别|重要度|标签)\s/.test(s)) { metaLine = s; seenMeta = true; continue; }
+      if (!seenMeta && !s) continue;
+      seenMeta = true;
+      body.push(line);
+    }
+    const content = body.join('\n').trim();
+    if (!content) continue;
+    const item = { content };
+    const pick = (re) => { const m = metaLine.match(re); return m ? m[1].trim() : null; };
+    const project = pick(/项目\s+([^·]+)/);
+    const kind = pick(/类别\s+([^·]+)/);
+    const importance = pick(/重要度\s+([^·]+)/);
+    const tagsRaw = pick(/标签\s+(.+)$/);
+    if (project) item.project = project;
+    if (kind && ['work', 'emotion', 'preference', 'unknown'].includes(kind)) item.kind = kind;
+    if (importance && ['key', 'important', 'casual', 'transient'].includes(importance)) item.importance = importance;
+    if (tagsRaw) item.tags = tagsRaw.split(/[,，]/).map((s) => s.trim()).filter(Boolean).slice(0, 20);
+    out.push(item);
+  }
+  return out;
+}
+
 function toMarkdown(records, config) {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
@@ -1074,6 +1113,33 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
         const next = writeConfig(body);
         return sendJson(res, 200, { ok: true, config: maskConfig(next) });
       }
+
+      /* POST /import —— 从 Markdown 导入（按 ## 分条，识别 项目/类别/重要度/标签） */
+      if (parts.length === 1 && parts[0] === 'import' && method === 'POST') {
+        const raw = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'bad json' }); }
+        const md = String(body.markdown || '');
+        if (!md.trim()) return sendJson(res, 400, { ok: false, error: '空内容' });
+        const items = parseMarkdownImport(md);
+        let created = 0;
+        const skipped = [];
+        for (const it of items) {
+          if (!it.content || it.content.trim().length < 2) { skipped.push('空正文'); continue; }
+          try {
+            store.put({
+              content: it.content,
+              kind: it.kind || 'unknown',
+              project: it.project || '',
+              importance: it.importance || 'important',
+              tags: Array.isArray(it.tags) ? it.tags : [],
+            });
+            created += 1;
+          } catch (e) { skipped.push(it.content.slice(0, 20) + '：' + (e && e.message)); }
+        }
+        return sendJson(res, 200, { ok: true, total: items.length, created, skipped: skipped.slice(0, 10) });
+      }
+
 
       /* GET /export —— 导出 Markdown */
       if (parts.length === 1 && parts[0] === 'export') {
