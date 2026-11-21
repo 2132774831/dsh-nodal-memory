@@ -24,7 +24,7 @@ import { tokenSet } from './text.js';
 
 export const GRAPH_EXPAND = {
   maxAdded: 4,              // 最多补 4 条
-  maxChars: 600,            // 总字数预算
+  maxChars: 1200,           // 总字数预算（600 太紧：单条长记忆就有 600+ 字，会被整条挡掉）
   whenFewerThan: 3,         // 命中不足 3 条才扩展
   minRelRatio: 0.6,         // 补进来的分数不得低于最高命中的 60%
   weight: 0.35,             // 基础折扣
@@ -121,23 +121,25 @@ export function expandByGraph(store, results, opts = {}) {
       } catch { /* 忽略 */ }
     }
 
-    /* 3. 同类事：共享标签 + 稀有词 overlap */
-    const hitTags = new Set((rec.tags || []).map(String));
-    if (hitTags.size && typeof store.list === 'function') {
-      const seen = new Set();
-      for (const tag of [...hitTags].slice(0, 3)) {
-        let rows = [];
-        try { rows = store.list({ tag, limit: 40 }) || []; } catch { rows = []; }
-        for (const r of rows) {
-          if (r.id === rec.id || seen.has(r.id)) continue;
-          seen.add(r.id);
-          const sharedTags = (r.tags || []).filter((t) => hitTags.has(String(t))).length;
-          if (sharedTags < 1) continue;
-          const ov = rareOverlap(sets.get(rec.id) || tokenSet(rec.content || ''),
-            sets.get(r.id) || tokenSet(r.content || ''), df, total);
-          if (ov >= cfg.kindredOverlap) candidates.push({ rec: r, why: 'kindred' });
-        }
+    /* 3. 同类事：只看内容重合（和关系图同一套口径）
+     *
+     * 早先这里要求"必须共享标签"，和图上的判定不一致：
+     * 图上能连起来的同类事，搜索时带不出来，用户会觉得"明明连了线却搜不到"。
+     * 现在统一成：不要求标签，只要求稀有词重合 ≥ 阈值，且不是两边都没项目。
+     * 候选池用上面算 IDF 时已经取过的 corpus，不额外查库。 */
+    if (typeof store.list === 'function') {
+      const recSet = sets.get(rec.id) || tokenSet(rec.content || '');
+      const mine = [];
+      for (const r of corpus) {
+        if (!r || r.id === rec.id || r.deletedAt) continue;
+        // 两边都没项目 → 谈不上归属，跳过（和图一致）
+        if (!rec.project && !r.project) continue;
+        const ov = rareOverlap(recSet, sets.get(r.id) || tokenSet(r.content || ''), df, total);
+        if (ov >= cfg.kindredOverlap) mine.push({ rec: r, why: 'kindred', ov });
       }
+      // 每命中最多补 2 条，按重合度从高到低
+      mine.sort((a, b) => b.ov - a.ov);
+      for (const c of mine.slice(0, 2)) candidates.push(c);
     }
 
     for (const c of candidates) {

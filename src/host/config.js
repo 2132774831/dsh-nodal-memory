@@ -83,6 +83,18 @@ export const DEFAULTS = {
     // 时间相邻边虽然"没信息量"，但它是唯一把记忆按时间串开、不让布局塌成一团的力。
     // 实测关掉后中间挤成一坨、文字互相压住，所以默认开着。
     timeEdges: true,
+    // 事件连线方式：
+    //   lexical —— 字词相似，自动算，零成本（默认）
+    //   ai-dsh  —— 由 DSH 里的模型在「整理」时判断（不用额外 key）
+    //   ai-key  —— 用应用里填的 key 调对话模型，后台自动跑
+    eventLinkMode: 'lexical',
+    // 连线整理间隔（天）。比体检（30 天）勤：事件归属变起来更快。
+    eventLinkIntervalDays: 7,
+    // ai-key 模式用的对话模型名（如 qwen4-max）
+    eventLinkModel: '',
+    // ai-key 模式：打开应用时也顺带整理一次
+    eventLinkOnStart: false,
+
     // 图扩展召回：关键词命中太少时，沿共现边补几条邻居（默认关，防自我强化回路）
     graphExpand: false,
 

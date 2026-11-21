@@ -90,6 +90,18 @@ export const DDL = [
   `CREATE INDEX IF NOT EXISTS idx_media_created ON memory_media(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_media_memory  ON memory_media(memory_id)`,
 
+  // AI 整理出来的"事件连线"（和字词相似是两条独立的路）
+  // a_id/b_id 存小写在前，保证同一对只存一行；reason 是模型给的理由，图上悬停能看到。
+  `CREATE TABLE IF NOT EXISTS memory_event_link (
+     a_id       TEXT NOT NULL,
+     b_id       TEXT NOT NULL,
+     reason     TEXT NOT NULL DEFAULT '',
+     source     TEXT NOT NULL DEFAULT 'ai',
+     created_at TEXT NOT NULL,
+     PRIMARY KEY (a_id, b_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_event_link_b ON memory_event_link(b_id)`,
+
   // 键值元信息：schema 版本、上次维护时间、上次体检时间等
   `CREATE TABLE IF NOT EXISTS memory_meta (
      k TEXT PRIMARY KEY,

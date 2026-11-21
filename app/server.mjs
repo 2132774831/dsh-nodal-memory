@@ -384,6 +384,45 @@ if (isMain) {
   console.log('  按 Ctrl+C 停止。数据只写在上面的数据目录里。');
   console.log('');
 
+  // ── 后台：AI 事件连线（可选功能，默认关闭；失败绝不影响主流程）──
+  let autoLinkStore = null;
+  try {
+    const core = await import(pathToFileURL(path.join(ROOT, 'src', 'core', 'index.js')).href);
+    const { readConfig } = await import(pathToFileURL(path.join(ROOT, 'src', 'host', 'config.js')).href);
+    const cfg = readConfig();
+    const feat = cfg.features || {};
+    const mode = feat.eventLinkMode || 'lexical';
+    if (mode === 'ai-key') {
+      autoLinkStore = core.openStore({ file: path.join(dataDir, 'dsh-local-memory.db') });
+      const runOnce = async (why) => {
+        const r = await core.runAutoEventLink({
+          store: autoLinkStore,
+          embedding: cfg.embedding || {},
+          model: feat.eventLinkModel,
+          log: (m) => console.log(m),
+        });
+        if (r.ok) {
+          try { autoLinkStore.setMeta('eventLinkLastRun', String(Date.now())); } catch { /* 记账失败无所谓 */ }
+        } else if (r.error) {
+          console.log('[auto-link] ' + why + '失败（不影响使用）：' + r.error);
+        }
+      };
+      let lastRun = 0;
+      try { lastRun = Number(autoLinkStore.getMeta('eventLinkLastRun') || 0) || 0; } catch { /* 没记过就是 0 */ }
+      if (feat.eventLinkOnStart === true) runOnce('启动时');
+      if (core.isAutoLinkDue(lastRun, feat.eventLinkIntervalDays)) runOnce('到期');
+      const timer = setInterval(() => {
+        let last = lastRun;
+        try { last = Number(autoLinkStore.getMeta('eventLinkLastRun') || 0) || 0; } catch { /* 忽略 */ }
+        if (core.isAutoLinkDue(last, feat.eventLinkIntervalDays)) runOnce('定时');
+      }, 3600 * 1000);
+      if (typeof timer.unref === 'function') timer.unref();
+      console.log('  事件连线：AI 整理已启用（每 ' + (feat.eventLinkIntervalDays || 7) + ' 天检查一次）');
+    }
+  } catch (err) {
+    console.log('[auto-link] 初始化失败（不影响使用）：' + (err && err.message ? err.message : err));
+  }
+
   let closing = false;
   const shutdown = async () => {
     if (closing) return;

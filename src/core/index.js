@@ -43,3 +43,5 @@ export {
 } from './embed.js';
 
 export { migrateFromV1, inferKind, normalizeProject } from './migrate.js';
+
+export { runAutoEventLink, isAutoLinkDue } from './auto-link.js';

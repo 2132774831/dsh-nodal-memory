@@ -1255,11 +1255,28 @@ function renderList() {
              <div class="itemActions">
                ${rec.deletedAt
                  ? '<button class="btn" data-act="restore">恢复</button><button class="btn btn--danger" data-act="purge">彻底删除</button>'
-                 : `<button class="btn${rec.pinned ? ' btn--primary' : ''}" data-act="pin" title="钉住后每轮自动回忆都会带上它">${rec.pinned ? '★ 已置顶' : '☆ 置顶'}</button><button class="btn" data-act="progress">追加进展</button><button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>`}
+                 : `<button class="btn${rec.pinned ? ' btn--primary' : ''}" data-act="pin" title="钉住后每轮自动回忆都会带上它">${rec.pinned ? '★ 已置顶' : '☆ 置顶'}</button><button class="btn" data-act="progress">追加进展</button><select class="input" data-act="imp" title="手动调权重：关键 > 重要 > 随口 > 易过期" style="width:auto;padding:2px 6px">
+                  ${IMPORTANCE_CHOICES.map((i) => `<option value="${i}"${rec.importance === i ? ' selected' : ''}>${IMPORTANCE_LABELS[i]}</option>`).join('')}
+                </select>
+                <button class="btn" data-act="edit">编辑</button><button class="btn btn--danger" data-act="delete">删除</button>`}
              </div>`}
       </div>`;
     }).join('');
   }
+
+  // 列表里直接调权重（不用点进「编辑」）
+  listEl.addEventListener('change', async (ev) => {
+    const sel = ev.target.closest('select[data-act="imp"]');
+    if (!sel) return;
+    const item = sel.closest('.item');
+    const id = item && item.getAttribute('data-id');
+    if (!id) return;
+    try {
+      await api('/memories/' + encodeURIComponent(id), { method: 'POST', body: JSON.stringify({ importance: sel.value }) });
+      toast('权重已改为「' + (IMPORTANCE_LABELS[sel.value] || sel.value) + '」');
+      load();
+    } catch (err) { toast('保存失败：' + err.message, true); }
+  });
 
   listEl.addEventListener('click', async (ev) => {
     const btn = ev.target.closest('button[data-act]');
@@ -1784,6 +1801,41 @@ function renderSettings() {
 
       <div class="item">
         <div class="itemHead">
+          <strong>事件连线</strong>
+          <span class="hint">谁来决定「哪几条记忆属于同一件事」</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="label">连线方式</span>
+          <select id="elMode" style="flex:0 1 280px">
+            <option value="lexical">字词相似（自动，零成本）</option>
+            <option value="ai-dsh">AI 整理 · 用 DSH 里的模型</option>
+            <option value="ai-key">AI 整理 · 用下面填的 key</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="label">整理间隔</span>
+          <input class="input" type="number" id="elDays" min="1" max="365" step="1" style="width:90px" />
+          <span class="hint">天（比「体检」勤一些）</span>
+        </div>
+        <div class="row" id="elModelRow">
+          <span class="label">整理模型</span>
+          <input class="input" type="text" id="elModel" placeholder="如 qwen4-max" style="flex:1 1 220px" />
+          <span class="hint">复用上面 embedding 的端点和 key</span>
+        </div>
+        <div class="row" id="elStartRow">
+          <label style="display:flex;gap:8px;align-items:center">
+            <input type="checkbox" id="elOnStart" />
+            <span>打开应用时也整理一次</span>
+          </label>
+        </div>
+        <div class="row" style="border-top:1px solid var(--line);padding-top:10px">
+          <button class="btn" id="elRun">立即整理一次</button>
+          <span class="hint" id="elResult"></span>
+        </div>
+      </div>
+
+      <div class="item">
+        <div class="itemHead">
           <strong>衰减速度（半衰期）</strong>
           <span class="hint">数字＝多少天后"相关度"掉一半。只影响排序，永不删数据</span>
         </div>
@@ -2112,6 +2164,14 @@ function renderSettings() {
     $('kwUnknown').value = String(kw.unknown ?? 1);
     $('kwHint').textContent = `情感 ${kw.emotion ?? 1}× ＝ 情感类命中排位按此放大`;
     $('fSens').value = s.config.conflictSensitivity || 'normal';
+    // 事件连线设置
+    const feat0 = s.config.features || {};
+    $('elMode').value = feat0.eventLinkMode || 'lexical';
+    $('elDays').value = String(feat0.eventLinkIntervalDays ?? 7);
+    $('elModel').value = feat0.eventLinkModel || '';
+    $('elOnStart').checked = feat0.eventLinkOnStart === true;
+    elModelRow.style.display = (elMode.value === 'ai-key') ? '' : 'none';
+    elStartRow.style.display = (elMode.value === 'ai-key') ? '' : 'none';
     $('mInfo').textContent = s.maintenance && s.maintenance.lastAt
       ? `上次 ${new Date(s.maintenance.lastAt).toLocaleString()}`
       : '还没跑过';
@@ -2182,6 +2242,54 @@ function renderSettings() {
       toast('灵敏度已保存');
     } catch (err) { toast('保存失败：' + err.message, true); }
   });
+
+  /* ── 事件连线设置 ── */
+  const saveEventCfg = async (patch) => {
+    await api('/config', { method: 'POST', body: JSON.stringify({ features: patch }) });
+  };
+  const syncEventRows = () => {
+    const mode = $('elMode').value;
+    if ($('elModelRow')) $('elModelRow').style.display = mode === 'ai-key' ? '' : 'none';
+    if ($('elStartRow')) $('elStartRow').style.display = mode === 'ai-key' ? '' : 'none';
+  };
+  if ($('elMode')) {
+    syncEventRows();
+    $('elMode').addEventListener('change', async () => {
+      syncEventRows();
+      try { await saveEventCfg({ eventLinkMode: $('elMode').value }); toast('连线方式已保存'); }
+      catch (err) { toast('保存失败：' + err.message, true); }
+    });
+    $('elDays').addEventListener('change', async () => {
+      const n = Math.max(1, Math.min(365, Number($('elDays').value) || 7));
+      $('elDays').value = String(n);
+      try { await saveEventCfg({ eventLinkIntervalDays: n }); } catch (err) { toast('保存失败：' + err.message, true); }
+    });
+    $('elModel').addEventListener('change', async () => {
+      try { await saveEventCfg({ eventLinkModel: $('elModel').value.trim() }); } catch (err) { toast('保存失败：' + err.message, true); }
+    });
+    $('elOnStart').addEventListener('change', async () => {
+      try { await saveEventCfg({ eventLinkOnStart: $('elOnStart').checked }); } catch (err) { toast('保存失败：' + err.message, true); }
+    });
+    $('elRun').addEventListener('click', async () => {
+      const box = $('elResult');
+      const mode = $('elMode').value;
+      if (mode === 'ai-dsh') {
+        box.textContent = '这个模式请在对话里说「整理一下事件连线」，我会用 DSH 的模型来做';
+        return;
+      }
+      if (mode === 'lexical') {
+        box.textContent = '字词相似是自动算的，不需要手动整理';
+        return;
+      }
+      box.textContent = '正在整理…';
+      try {
+        const r = await api('/event-links/run', { method: 'POST' });
+        box.textContent = r.ok ? ('已写入 ' + (r.written || 0) + ' 条连线') : ('失败：' + (r.error || r.skipped || '未知'));
+      } catch (err) {
+        box.textContent = '失败：' + err.message;
+      }
+    });
+  }
 
   $('fReset').addEventListener('click', async () => {
     try {

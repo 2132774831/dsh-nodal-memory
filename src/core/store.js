@@ -83,6 +83,12 @@ function normalizeTags(tags) {
  * @param {object} [opts]
  * @param {boolean} [opts.maskPII=true] 关掉＝我就是要存完整原文（给高级用户留的口子）
  */
+function normalizePair(a, b) {
+  const x = String(a);
+  const y = String(b);
+  return x <= y ? [x, y] : [y, x];
+}
+
 export function normalizeRecord(input, now = Date.now(), opts = {}) {
   const createdAt = toMs(input.createdAt) ?? now;
   const updatedAt = toMs(input.updatedAt) ?? now;
@@ -343,6 +349,8 @@ class SqliteBackend {
     this.db.prepare('DELETE FROM memory_update WHERE memory_id=?').run(id);
     // 顺手清掉共现记录：留着会变成指向不存在节点的孤儿边，越积越多
     this.db.prepare('DELETE FROM memory_cooccur WHERE a=? OR b=?').run(id, id);
+    // 事件连线也是引用，必须跟着清，否则同样是孤儿边
+    this.db.prepare('DELETE FROM memory_event_link WHERE a_id=? OR b_id=?').run(id, id);
     this.db.prepare('DELETE FROM memory_vec WHERE memory_id=?').run(id);
     this.db.prepare('DELETE FROM memory WHERE id=?').run(id);
     return true;
@@ -474,6 +482,53 @@ class SqliteBackend {
     const sql = 'SELECT COUNT(*) AS n FROM memory_media' + (includeDeleted ? '' : ' WHERE deleted_at IS NULL');
     return this.db.prepare(sql).get().n;
   }
+
+  /* ── 事件连线（AI 整理出来的） ── */
+
+  /** 写入一条事件连线。同一对只会保留一行（重复写入等于更新理由） */
+  putEventLink(aId, bId, { reason = '', source = 'ai', at = Date.now() } = {}) {
+    const [a, b] = normalizePair(aId, bId);
+    if (!a || !b || a === b) return false;
+    try {
+      this.db.prepare(
+        'INSERT INTO memory_event_link (a_id, b_id, reason, source, created_at) VALUES (?,?,?,?,?) ' +
+        'ON CONFLICT(a_id, b_id) DO UPDATE SET reason=excluded.reason, source=excluded.source'
+      ).run(a, b, String(reason || '').slice(0, 200), String(source || 'ai'), toIso(at));
+      return true;
+    } catch { return false; }
+  }
+
+  /** 列出事件连线；只返回两端记忆都还活着（未删除）的 */
+  listEventLinks({ limit = 2000 } = {}) {
+    try {
+      return this.db.prepare(
+        'SELECT l.a_id AS a, l.b_id AS b, l.reason, l.source, l.created_at AS createdAt ' +
+        'FROM memory_event_link l ' +
+        'JOIN memory ma ON ma.id = l.a_id AND ma.deleted_at IS NULL ' +
+        'JOIN memory mb ON mb.id = l.b_id AND mb.deleted_at IS NULL ' +
+        'ORDER BY l.created_at DESC LIMIT ?'
+      ).all(Math.max(1, Math.min(20000, Number(limit) || 2000)));
+    } catch { return []; }
+  }
+
+  removeEventLink(aId, bId) {
+    const [a, b] = normalizePair(aId, bId);
+    try { this.db.prepare('DELETE FROM memory_event_link WHERE a_id=? AND b_id=?').run(a, b); return true; } catch { return false; }
+  }
+
+  /** AI 重新整理时先清空旧结论（source 可限定，避免误删手动连线） */
+  clearEventLinks({ source = null } = {}) {
+    try {
+      if (source) this.db.prepare('DELETE FROM memory_event_link WHERE source=?').run(String(source));
+      else this.db.prepare('DELETE FROM memory_event_link').run();
+      return true;
+    } catch { return false; }
+  }
+
+  countEventLinks() {
+    try { return this.db.prepare('SELECT COUNT(*) AS n FROM memory_event_link').get().n; } catch { return 0; }
+  }
+
 
   getMeta(k) {
     const row = this.stMetaGet.get(k);
@@ -633,6 +688,7 @@ class JsonBackend {
     this.cooccur = new Map();
     this.vectors = new Map();
     this.updates = new Map();
+    this.eventLinks = new Map();
     this.depth = 0;
     this.dirty = false;
     if (fs.existsSync(file)) {
@@ -647,6 +703,7 @@ class JsonBackend {
       for (const [key, v] of Object.entries(data.cooccur ?? {})) this.cooccur.set(key, v);
       for (const [id, v] of Object.entries(data.vectors ?? {})) this.vectors.set(id, v);
       for (const [id, arr] of Object.entries(data.updates ?? {})) this.updates.set(id, arr);
+    for (const [key, v] of Object.entries(data.eventLinks ?? {})) this.eventLinks.set(key, v);
       for (const r of data.memories ?? []) {
         // 读入时不再脱敏：脱敏是写入时的职责，重复跑会无谓改写历史文本
         const rec = normalizeRecord(r, undefined, { maskPII: false });
@@ -665,6 +722,7 @@ class JsonBackend {
       cooccur: Object.fromEntries(this.cooccur),
       vectors: Object.fromEntries(this.vectors),
       updates: Object.fromEntries(this.updates),
+      eventLinks: Object.fromEntries(this.eventLinks),
       memories: [...this.records.values()],
     };
     const tmp = this.file + '.tmp-' + process.pid;
@@ -890,6 +948,51 @@ class JsonBackend {
   countMedia({ includeDeleted = false } = {}) {
     return (this.media || []).filter((m) => includeDeleted || !m.deletedAt).length;
   }
+
+  /* ── 事件连线（JSON 兜底后端）：存成 this.eventLinks（Map） ── */
+
+  putEventLink(aId, bId, { reason = '', source = 'ai', at = Date.now() } = {}) {
+    const [a, b] = normalizePair(aId, bId);
+    if (!a || !b || a === b) return false;
+    this.eventLinks.set(a + '|' + b, {
+      a, b,
+      reason: String(reason || '').slice(0, 200),
+      source: String(source || 'ai'),
+      createdAt: toIso(at),
+    });
+    this.flush();
+    return true;
+  }
+
+  listEventLinks({ limit = 2000 } = {}) {
+    // 注意：JSON 后端的删除是软删（deletedAt），所以不能只看 records 有没有这个 key
+    const alive = new Set([...this.records.values()].filter((r) => !r.deletedAt).map((r) => r.id));
+    return [...this.eventLinks.values()]
+      .filter((l) => alive.has(l.a) && alive.has(l.b))
+      .slice(0, Math.max(1, Math.min(20000, Number(limit) || 2000)));
+  }
+
+  removeEventLink(aId, bId) {
+    const [a, b] = normalizePair(aId, bId);
+    this.eventLinks.delete(a + '|' + b);
+    this.flush();
+    return true;
+  }
+
+  clearEventLinks({ source = null } = {}) {
+    if (source) {
+      for (const [key, l] of [...this.eventLinks]) if (l.source === source) this.eventLinks.delete(key);
+    } else {
+      this.eventLinks.clear();
+    }
+    this.flush();
+    return true;
+  }
+
+  countEventLinks() {
+    return this.eventLinks.size;
+  }
+
 
   getMeta(k) { return this.meta.get(k) ?? null; }
   setMeta(k, v) { this.meta.set(k, String(v)); this.flush(); }

@@ -912,6 +912,13 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           const have = store.getVectors(ids);
           if (have && have.size > 0) vectors = have;
         }
+        // AI 整理出来的事件连线（可能为空；空了就只是不画这层）
+        let eventLinks = [];
+        if (typeof store.listEventLinks === 'function') {
+          try { eventLinks = store.listEventLinks({ limit: 2000 }); } catch { eventLinks = []; }
+        }
+        // 只有「字词相似」模式才自动算同类事；选了 AI 整理就不算，避免两套结论打架
+        const linkMode = feat.eventLinkMode || 'lexical';
         const graph = buildGraph(records, {
           cooccur,
           vectors,
@@ -920,11 +927,33 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
           maxGroupSize: parseInt_(query.maxGroupSize, 12, 2, 500),
           semanticThreshold: Number.isFinite(Number(query.sim)) ? Number(query.sim) : undefined,
           semanticTopK: parseInt_(query.topK, 3, 1, 10),
+          eventLinks,
+          includeKindred: linkMode === 'lexical',
           includeProject: feat.projectEdges === true,
           includeTime: feat.timeEdges === true,
           labelChars: parseInt_(query.labelChars, 60, 10, 400),
         });
         return sendJson(res, 200, { ok: true, ...graph, features: feat });
+      }
+
+      /* POST /event-links/run —— 立刻用应用里的 key 整理一次事件连线 */
+      if (parts.length === 2 && parts[0] === 'event-links' && parts[1] === 'run' && method === 'POST') {
+        const cfg = readConfig();
+        const feat = cfg.features || {};
+        if ((feat.eventLinkMode || 'lexical') !== 'ai-key') {
+          return sendJson(res, 400, { ok: false, error: '当前不是「应用 key」模式，用不到这个按钮' });
+        }
+        try {
+          const r = await runAutoEventLink({
+            store,
+            embedding: cfg.embedding || {},
+            model: feat.eventLinkModel,
+          });
+          if (r.ok) { try { store.setMeta('eventLinkLastRun', String(Date.now())); } catch { /* 忽略 */ } }
+          return sendJson(res, r.ok ? 200 : 400, r);
+        } catch (e) {
+          return sendJson(res, 500, { ok: false, error: e && e.message ? e.message : String(e) });
+        }
       }
 
       /* POST /classify/auto —— 给存量未分类记忆按内容补标（先 dryRun 预览，再执行） */

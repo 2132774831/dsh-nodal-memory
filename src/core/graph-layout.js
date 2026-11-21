@@ -159,6 +159,9 @@ export const EDGE_STYLES = {
   semantic: { color: 'rgba(186,140,255,0.6)', width: 1.0, dash: [2, 4], label: '语义相近' },
   project: { color: 'rgba(120,200,160,0.40)', width: 1.1, dash: null, label: '同项目' },
   time: { color: 'rgba(160,160,170,0.20)', width: 0.9, dash: [3, 4], label: '时间相邻' },
+  session: { color: 'rgba(236,130,210,0.85)', width: 1.5, dash: null, label: '同一次对话' },
+  kindred: { color: 'rgba(90,220,235,0.6)', width: 1.1, dash: [6, 3], label: '同类事' },
+  event: { color: 'rgba(120,255,200,0.95)', width: 2.0, dash: null, label: 'AI 认定同一件事' },
 };
 
 export function kindColor(kind) {

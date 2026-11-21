@@ -17,6 +17,8 @@
  *   - 输出 degree / isolated，让界面能把孤岛单独拎出来
  */
 
+import { tokenSet } from './text.js';
+
 const DEFAULT_MAX_EDGES = 4000;
 const DEFAULT_DOMINANT_RATIO = 0.3;
 const DEFAULT_TIME_WINDOW_DAYS = 7;
@@ -37,6 +39,12 @@ const DEFAULT_SEMANTIC_MAX_NODES = 600;
  * 所以超过这个数就整组不连（真实数据上 default-workspace 有 59 条，正是这种情况）。
  */
 const DEFAULT_MAX_GROUP_SIZE = 12;
+/** 同类事边：稀有词 IDF overlap 下限（实测 109 条语料里 0.05 命中 27 对 / 0.46%） */
+const DEFAULT_KINDRED_THRESHOLD = 0.05;
+/** 每个节点最多连 2 条同类事边（防糊：宁可少连，也不要一团毛线） */
+const DEFAULT_KINDRED_PER_NODE = 2;
+/** 超过这么多节点就不算同类事（O(n^2)，语料大了会卡） */
+const DEFAULT_KINDRED_MAX_NODES = 400;
 
 const KIND_PRIORITY = { cooccur: 4, tag: 3, semantic: 2, project: 1, time: 0 };
 
@@ -68,6 +76,12 @@ export function buildGraph(records, opts = {}) {
     semanticTopK = DEFAULT_SEMANTIC_TOPK,
     semanticMaxNodes = DEFAULT_SEMANTIC_MAX_NODES,
     includeProject = true,
+    eventLinks = [],
+    includeSession = true,
+    includeKindred = true,
+    kindredThreshold = DEFAULT_KINDRED_THRESHOLD,
+    kindredPerNode = DEFAULT_KINDRED_PER_NODE,
+    kindredMaxNodes = DEFAULT_KINDRED_MAX_NODES,
     includeTime = true,
     labelChars = 60,
   } = opts;
@@ -241,6 +255,13 @@ export function buildGraph(records, opts = {}) {
 
   // ── 4. 时间相邻：只连"时间上最近的一条"，避免 O(n²) 糊成一团
   // 这条关系几乎不承载信息（只是让布局别散成飞地），所以也可以关掉。
+  //
+  // 同场（session）合并进这条链，而不是另起一套边：
+  //   session 内连续产生的记忆，本来就是全局时间上挨着的那几条，
+  //   两套链画的是同一批线，只是"跨界"处不同。
+  //   所以只画一条链，**同场段用实线、跨场段用虚线**——
+  //   一条线同时回答了"先后顺序"和"哪段属于同一次对话"，
+  //   边的类型数不增加，也不会出现两种链互相叠着画的情况。
   if (includeTime) {
     const order = list.map((rec, i) => ({ i, t: rec.createdAt })).sort((a, b) => a.t - b.t);
     for (let k = 1; k < order.length; k++) {
@@ -248,11 +269,96 @@ export function buildGraph(records, opts = {}) {
       const cur = order[k];
       const days = (cur.t - prev.t) / 86400000;
       if (days > timeWindowDays) continue;
-      const weight = 0.15 * (1 - Math.min(1, days / timeWindowDays));
-      addEdge(prev.i, cur.i, 'time', Math.max(0.05, weight), '创建时间相邻');
+      const a = list[prev.i];
+      const b = list[cur.i];
+      const sameSession = includeSession && a.sessionId && b.sessionId && a.sessionId === b.sessionId;
+      const weight = sameSession
+        ? 0.85                                    // 同一次对话：强，画实线
+        : 0.15 * (1 - Math.min(1, days / timeWindowDays));
+      addEdge(prev.i, cur.i, sameSession ? 'session' : 'time',
+        Math.max(0.05, weight), sameSession ? '同一次对话' : '创建时间相邻');
+    }
+
+    // 会话内可能被别的会话打断（交错写入），上面那条全局链就会漏掉组内相邻。
+    // 这里补一段组内链：只连"组内相邻的两条"，仍然是链不是全连接。
+    const bySession = new Map();
+    for (let i = 0; i < n; i++) {
+      const sid = list[i].sessionId;
+      if (!sid) continue;
+      if (!bySession.has(sid)) bySession.set(sid, []);
+      bySession.get(sid).push(i);
+    }
+    for (const [, members] of (includeSession ? bySession : [])) {
+      if (members.length < 2) continue;
+      const seq = members.slice().sort((x, y) => (list[x].createdAt || 0) - (list[y].createdAt || 0));
+      for (let k = 1; k < seq.length; k++) {
+        addEdge(seq[k - 1], seq[k], 'session', 0.7, '同一次对话');
+      }
     }
   }
 
+  // ── 4.5 AI 整理出来的事件连线（和字词相似是两条独立的路）
+  // 这些是模型判断过的「确实是同一件事」，优先画成亮线；
+  // 字词相似要不要算，由调用方按 eventLinkMode 决定。
+  for (const l of Array.isArray(eventLinks) ? eventLinks : []) {
+    const i = index.get(l.a);
+    const j = index.get(l.b);
+    if (i == null || j == null) continue;
+    addEdge(i, j, 'event', 1.2, String(l.reason || '同一件事'));
+  }
+
+  // ── 5. 同类事：不同项目，但内容讲的是一类东西
+  //
+  // 判定只看两个条件：**项目不同** + **稀有词重合度够**。
+  // 为什么不再要求"共享标签"：实测会发现那样等于把标签边重画一遍
+  // （120 条语料里 706 对共享标签，过阈值只剩 5 对，其中 4 对本来就有边）。
+  // 去掉标签条件后，0.05 能补出 4 条真正新增的关系，抽查 3 条都与主题吻合。
+  // 为什么不用余弦相似度：实测 token 余弦最大只有 0.333，0.35 的门槛连一条都连不出来。
+  if (includeKindred && n >= 3 && n <= kindredMaxNodes) {
+    const sets = list.map((rec) => tokenSet(rec.content || ''));
+    const df = new Map();
+    for (const s of sets) for (const w of s) df.set(w, (df.get(w) || 0) + 1);
+    const idf = (w) => Math.log(1 + n / Math.max(1, df.get(w) || 1));
+    const weights = sets.map((s) => { let t = 0; for (const w of s) t += idf(w); return t; });
+
+    const cands = [];
+    for (let i = 0; i < n; i++) {
+      const pi = list[i].project || '';
+      for (let j = i + 1; j < n; j++) {
+        const pj = list[j].project || '';
+        // 注意：**不再要求跨项目**。
+        // 最初限定"必须跨项目"，结果正好漏掉最该连的那类关系：
+        // 同一个程序、不同时间修的两次 bug（同项目、内容相似），
+        // 而"同项目边"又因为项目太大（80 条 > 12 条上限）整组不画，两头都落空。
+        // 现在只看内容重合，同项目/跨项目一视同仁。
+        if (!pi && !pj) continue;           // 两边都没项目，谈不上归属
+        const A = sets[i], B = sets[j];
+        let shared = 0;
+        // 只认稀有词（df <= 3）：满库都有的词说明不了"同一类事"
+        for (const w of A) if (B.has(w) && (df.get(w) || 0) <= 3) shared += idf(w);
+        if (!shared) continue;
+        const minW = Math.min(weights[i], weights[j]);
+        if (minW <= 0) continue;
+        const ov = shared / minW;
+        if (ov >= kindredThreshold) cands.push({ i, j, ov });
+      }
+    }
+
+    // 按重合度从高到低挑，每点最多 2 条、总量不超过 1.5N（防糊的预算闸）
+    cands.sort((a, b) => b.ov - a.ov);
+    const usedDeg = new Map();
+    const budget = Math.max(1, Math.floor(1.5 * n));
+    let taken = 0;
+    for (const c of cands) {
+      if (taken >= budget) break;
+      if ((usedDeg.get(c.i) || 0) >= kindredPerNode) continue;
+      if ((usedDeg.get(c.j) || 0) >= kindredPerNode) continue;
+      addEdge(c.i, c.j, 'kindred', Math.min(1, c.ov * 4), '同类事 ' + c.ov.toFixed(2));
+      usedDeg.set(c.i, (usedDeg.get(c.i) || 0) + 1);
+      usedDeg.set(c.j, (usedDeg.get(c.j) || 0) + 1);
+      taken++;
+    }
+  }
   // ── 收口：按权重排序、截断、算度数
   const edges = [...edgeMap.values()]
     .sort((x, y) => y.weight - x.weight)

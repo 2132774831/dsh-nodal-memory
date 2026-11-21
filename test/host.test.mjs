@@ -99,12 +99,12 @@ function makeDecision(userText) {
 
 // ---------------------------------------------------------------- 注册
 
-test('apply 注册全部工具（6 个记忆工具 + 2 个图片工具）', () => {
+test('apply 注册全部工具（7 个记忆工具 + 2 个图片工具）', () => {
   const m = mount();
   const names = [...m.tools.keys()].sort();
   assert.deepEqual(names, [
     'image_save', 'image_search',
-    'memory_forget', 'memory_list', 'memory_review', 'memory_save', 'memory_search', 'memory_update',
+    'memory_forget', 'memory_link_events', 'memory_list', 'memory_review', 'memory_save', 'memory_search', 'memory_update',
   ]);
 });
 

@@ -584,5 +584,96 @@ export function buildTools(deps) {
           return '已存入图片库。id=' + rec0.id + '（以后用 image_search 按说明找）';
         },
       }),
+    /**
+     * 事件连线：让模型自己判断"哪几条记忆属于同一件事"。
+     *
+     * 为什么不用字词相似：两条记忆都可能提到"数据库迁移"，
+     * 但一条讲 MySQL、一条讲备份策略——字面重合高，却不是同一件事。
+     * 判断权交给能读懂内容的模型，结果存成显式连线（图上画得出来、能悬停看理由）。
+     */
+    defineTool({
+      name: 'memory_link_events',
+      description:
+        '整理「哪些记忆属于同一件事」，把判断结果写成事件连线（关系图上会显示）。'
+        + '先 action=propose 拿到候选清单，自己读完判断，再 action=apply 提交；'
+        + 'action=clear 清掉此前 AI 整理的连线（重新整理时先清后写）。'
+        + '只在系统提示说「该整理事件连线了」、或用户明确要求整理时使用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['propose', 'apply', 'clear'],
+            description: 'propose=拿候选清单；apply=提交判断；clear=清空 AI 连线',
+          },
+          limit: {
+            type: 'number',
+            description: 'propose 时最多返回多少条记忆（默认 40，最多 120）',
+          },
+          links: {
+            type: 'array',
+            description: 'apply 时提交的连线数组，每条指出两条记忆 id 和理由',
+            items: {
+              type: 'object',
+              properties: {
+                a: { type: 'string', description: '记忆 id' },
+                b: { type: 'string', description: '另一条记忆 id' },
+                reason: { type: 'string', description: '为什么它们是同一件事（一句话）' },
+              },
+              required: ['a', 'b'],
+            },
+          },
+        },
+        required: ['action'],
+      },
+      run: async (args) => {
+        const cfg = getConfig();
+        if (!cfg.enabled) return disabled();
+        const store = getStore();
+        const action = String(args.action || '').trim();
+
+        if (action === 'clear') {
+          store.clearEventLinks({ source: 'ai' });
+          return '已清空 AI 整理的事件连线，可以重新整理了。';
+        }
+
+        if (action === 'apply') {
+          const links = Array.isArray(args.links) ? args.links : [];
+          if (!links.length) return '没有提交任何连线。';
+          let ok = 0;
+          const bad = [];
+          for (const l of links.slice(0, 300)) {
+            const ida = String(l && l.a ? l.a : '').trim();
+            const idb = String(l && l.b ? l.b : '').trim();
+            if (!ida || !idb || ida === idb) { bad.push(ida + '/' + idb); continue; }
+            if (!store.get(ida) || !store.get(idb)) { bad.push(ida + '/' + idb); continue; }
+            if (store.putEventLink(ida, idb, { reason: l.reason || '', source: 'ai' })) ok += 1;
+            else bad.push(ida + '/' + idb);
+          }
+          let msg = '已写入 ' + ok + ' 条事件连线（当前共 ' + store.countEventLinks() + ' 条）。';
+          if (bad.length) msg += '\n跳过了 ' + bad.length + ' 条（id 不存在或重复）：' + bad.slice(0, 5).join('、');
+          return msg;
+        }
+
+        const limit = Math.max(5, Math.min(120, Number(args.limit) || 40));
+        const rows = store.list({ limit });
+        if (!rows.length) return '记忆库还是空的，没有可整理的记忆。';
+        const existing = store.listEventLinks();
+        const lines = [
+          '候选记忆（共 ' + rows.length + ' 条，已有事件连线 ' + existing.length + ' 条）',
+          '',
+        ];
+        for (const r of rows) {
+          const date = fmtDate(r.createdAt);
+          const tags = (r.tags || []).slice(0, 3).join(',');
+          lines.push('- ' + r.id + ' | ' + date + ' | ' + (r.kind || 'unknown') + (tags ? ' | ' + tags : ''));
+          lines.push('    ' + String(r.content || '').replace(/\s+/g, ' ').slice(0, 70));
+        }
+        lines.push('');
+        lines.push('判断完请调用 memory_link_events 且 action=apply，提交 [[a,b,理由]...]；');
+        lines.push('只连"确实是同一件事"的（同一次排障、同一个项目的同一阶段），不要因为主题相近就连。');
+        return lines.join('\n');
+      },
+    }),
   ];
 }
