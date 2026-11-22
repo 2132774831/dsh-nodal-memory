@@ -837,6 +837,7 @@ function renderGraph() {
       needsDraw = true;
       if (!dragging && isSettled(layout) && !settledTold) {
         settledTold = true;
+        lastFitW = box.clientWidth; lastFitH = box.clientHeight;
         statsEl.textContent += ` · 已收敛（${layout.iterations} 步）`;
         // 收敛后位置还会被分离/力推着微调，此时再适应一次窗口，否则边缘卡片会被切掉
         fitView();
@@ -1237,7 +1238,24 @@ function renderGraph() {
 
 document.getElementById('gFit').addEventListener('click', () => fitView({ allowTiny: true }));
 
-  const onResize = () => { resize(); };
+  /**
+   * 窗口尺寸变了要重新适配：否则自适应是按旧尺寸算的，
+   * 窗口变大后图就缩在中间一小团（用户实测截图就是这个现象）。
+   * 只在尺寸变化超过 12% 时重算，避免拖拽窗口时一直跳。
+   */
+  let lastFitW = 0; let lastFitH = 0; let resizeTimer = 0;
+  const onResize = () => {
+    resize();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!layout) return;
+      const w = box.clientWidth; const h = box.clientHeight;
+      const changed = !lastFitW || Math.abs(w - lastFitW) / lastFitW > 0.12 || Math.abs(h - lastFitH) / lastFitH > 0.12;
+      if (!changed) return;
+      lastFitW = w; lastFitH = h;
+      fitView({ allowTiny: true });
+    }, 250);
+  };
   window.addEventListener('resize', onResize);
 
   resize();

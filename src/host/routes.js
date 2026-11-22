@@ -106,10 +106,18 @@ function startupLinkPath() {
   return path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', '本地记忆.lnk');
 }
 
-/** 独立软件的 exe 在哪：包根目录下的 LocalMemory.exe（插件模式下可能不存在） */
+/**
+ * 独立软件的 exe 在哪（插件模式下可能不存在）。
+ *
+ * 优先 MemoryApp.exe（原生窗口，和桌面快捷方式一致）；
+ * 只有它不存在时才退回旧的 LocalMemory.exe —— 那个是浏览器启动器，
+ * 开机自启动用它就会弹出一个网页，而不是程序窗口（用户实测反馈）。
+ */
 function appExePath() {
-  const exe = path.resolve(PKG_ROOT, 'LocalMemory.exe');
-  return fs.existsSync(exe) ? exe : null;
+  const native = path.resolve(PKG_ROOT, 'MemoryApp.exe');
+  if (fs.existsSync(native)) return native;
+  const legacy = path.resolve(PKG_ROOT, 'LocalMemory.exe');
+  return fs.existsSync(legacy) ? legacy : null;
 }
 
 export function autostartStatus() {
