@@ -221,6 +221,33 @@ static class InstallerCard
     }
 
     /// payload.zip 里程序文件在 payload\ 子目录下，要摊平到安装根目录
+    /// <summary>
+    /// 升级时先清掉「本安装包会覆盖的那些路径」。
+    /// 不清理会残留上一版的文件（实测：装过 342 个旧文件，界面还在用旧的）。
+    /// 只删我们自己发的东西，用户放在这个目录里的其它文件不动。
+    /// </summary>
+    static readonly string[] PayloadPaths = new string[]
+    {
+        "app", "src", "node_modules", "scripts", "vendor", "assets",
+        "MemoryApp.exe", "LocalMemory.exe", "package.json",
+        "cordis.patch.yml", "README.md", "LICENSE",
+        "WebView2Loader.dll", "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll",
+    };
+
+    static void CleanPayloadPaths(string target)
+    {
+        foreach (string name in PayloadPaths)
+        {
+            try
+            {
+                string p = Path.Combine(target, name);
+                if (Directory.Exists(p)) Directory.Delete(p, true);
+                else if (File.Exists(p)) File.Delete(p);
+            }
+            catch { /* 删不掉就跳过，覆盖安装仍会覆盖同名文件 */ }
+        }
+    }
+
     static void FlattenPayload(string target)
     {
         string sub = Path.Combine(target, "payload");
@@ -251,6 +278,7 @@ static class InstallerCard
                 if (s == null) return false;
                 using (var fs = File.Create(tmpZip)) s.CopyTo(fs);
             }
+            CleanPayloadPaths(target);
             ZipFile.ExtractToDirectory(tmpZip, target);
             FlattenPayload(target);
             try { File.Delete(tmpZip); } catch { }
@@ -313,6 +341,7 @@ static class InstallerCard
             }
             bar.Value = 45;
 
+            CleanPayloadPaths(target);
             ZipFile.ExtractToDirectory(tmpZip, target);
             FlattenPayload(target);
             bar.Value = 75;
