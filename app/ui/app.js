@@ -1368,13 +1368,15 @@ function renderList() {
 
     try {
       if (act === 'pin') {
-          // 置顶/取消置顶：钉住的记忆每轮自动回忆都会带上（见 recall.js）
-          const d = await fetchDetail(id);
-      const cur = !!(d && d.memory && d.memory.pinned);
-      detailCache.delete(id);   // 状态变了，缓存作废
-          await api('/memories/' + encodeURIComponent(id), { method: 'POST', body: JSON.stringify({ pinned: !cur }) });
-          toast(cur ? '已取消置顶' : '已置顶：每轮自动回忆都会带上它');
-        }
+        // 置顶/取消置顶：钉住的记忆每轮自动回忆都会带上（见 recall.js）
+        //
+        // 注意：这里**不能**用 fetchDetail()——它定义在关系图的作用域里，
+        // 列表页调用会抛 ReferenceError，表现就是"点置顶没反应"（曾因此坏了很久）。
+        // 直接按按钮当前文字判断状态，最省事也不会跨作用域。
+        const cur = btn.textContent.includes('已置顶');
+        await api('/memories/' + encodeURIComponent(id), { method: 'POST', body: JSON.stringify({ pinned: !cur }) });
+        toast(cur ? '已取消置顶' : '已置顶：每轮自动回忆都会带上它');
+      }
         else if (act === 'delete') await api('/memories/' + encodeURIComponent(id), { method: 'DELETE' });
       else if (act === 'purge') await api('/memories/' + encodeURIComponent(id) + '/purge', { method: 'POST' });
       else if (act === 'restore') await api('/memories/' + encodeURIComponent(id) + '/restore', { method: 'POST' });
@@ -2160,6 +2162,7 @@ function renderSettings() {
    * 顺序按"最有用的在前"排。
    */
   const FEATURES = [
+    ['pinAlways', '置顶每轮必带（强制命中）', '钉住的记忆不管这轮问什么都会进上下文，最多 3 条。关掉＝置顶只在检索命中时排最前面'],
     ['semanticEdges', '语义连线', '图上按向量相似度连紫色点线。用已有向量，不额外花钱'],
     ['conflictMarks', '疑似冲突标黄', '关系图上把疑似冲突的记忆标黄圈'],
     ['conflictScan', '疑似冲突扫描', '直觉页列出"说同一件事但关键处不一样"的两条'],
