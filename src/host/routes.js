@@ -23,6 +23,7 @@ import { inferKindFromContent, classifyBatch } from '../core/classify.js';
 import { findConsolidationGroups, applyConsolidation } from '../core/consolidate.js';
 import { getEmbedder, backfillVectors, queryVectorFor } from './embedding.js';
 import { reviewStore } from './tools.js';
+import { localLinkPairs } from '../core/local-link.js';
 import { ensureAppRunning } from './app-link.js';
 import { execFile } from 'node:child_process';
 
@@ -982,6 +983,27 @@ export function registerRoutes(ctx, deps) {  const { getStore, disposers } = dep
         });
         return sendJson(res, 200, { ok: true, ...graph, features: feat });
       }
+
+      /* POST /event-links/local —— 用本地小模型整理连线（完全离线，不发网络请求） */
+      if (parts.length === 2 && parts[0] === 'event-links' && parts[1] === 'local' && method === 'POST') {
+        const raw = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch { body = {}; }
+        const threshold = Number(body.threshold);
+        const rows = store.list({ limit: 2000 });
+        const pairs = localLinkPairs(rows, {
+          threshold: Number.isFinite(threshold) ? Math.min(0.95, Math.max(0.1, threshold)) : 0.20,
+          topK: 2,
+        });
+        // 重新整理：先清掉上次本地模型写的连线，避免新旧混在一起
+        try { store.clearEventLinks({ source: 'local-mini' }); } catch { /* 忽略 */ }
+        let written = 0;
+        for (const p of pairs) {
+          if (store.putEventLink(p.a, p.b, { reason: '本地小模型：相似度 ' + p.score, source: 'local-mini' })) written += 1;
+        }
+        return sendJson(res, 200, { ok: true, candidates: pairs.length, written, total: store.countEventLinks() });
+      }
+
 
       /* POST /event-links/run —— 立刻用应用里的 key 整理一次事件连线 */
       if (parts.length === 2 && parts[0] === 'event-links' && parts[1] === 'run' && method === 'POST') {

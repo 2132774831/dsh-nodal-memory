@@ -895,7 +895,6 @@ function renderGraph() {
 
   /* ── 右键详情弹层 ── */
 
-  let popupEl = null;
 
   /**
    * 详情缓存。
@@ -928,69 +927,9 @@ function renderGraph() {
     }
   }
 
-  function closePopup() {
-    if (popupEl) { popupEl.remove(); popupEl = null; }
-  }
+  function closePopup() { /* 预览框已移除，保留空实现给旧调用点 */ }
 
-  function showPopup(node, clientX, clientY) {
-    closePopup();
-    const el = document.createElement('div');
-    el.className = 'nodemenu';
-    const tags = (node.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('');
-    el.innerHTML = `
-      <div class="nodemenu__head">
-        <span class="tag" style="background:${kindColor(node.kind, theme)}33;border-color:${kindColor(node.kind, theme)}">${esc(KIND_LABELS[node.kind] || node.kind)}</span>
-        <span class="hint">${esc(ageLabel(node.createdAt))}</span>
-        ${node.isolated ? '<span class="tag tag--warn">孤岛</span>' : ''}
-        <button class="nodemenu__x" title="关闭">✕</button>
-      </div>
-      <div class="meta">
-        ${node.project ? `<span class="tag">${esc(node.project)}</span>` : ''}
-        ${node.importance && node.importance !== 'important' ? `<span class="tag">${esc(IMPORTANCE_LABELS[node.importance] || node.importance)}</span>` : ''}
-        <span>连接 ${node.linkDegree || 0}</span>
-      </div>
-      ${tags ? `<div class="meta">${tags}</div>` : ''}
-      <div class="nodemenu__body">${esc(inlineText(node.label || ''))}</div>
-      <div class="nodemenu__foot">
-        <span class="mono">${esc(node.id)}</span>
-        <button class="btn" data-copy>复制正文</button>
-      </div>`;
 
-    document.body.appendChild(el);
-    // 贴着鼠标放，但不许溢出窗口
-    const r = el.getBoundingClientRect();
-    const left = Math.max(8, Math.min(clientX + 10, window.innerWidth - r.width - 8));
-    const top = Math.max(8, Math.min(clientY + 10, window.innerHeight - r.height - 8));
-    el.style.left = left + 'px';
-    el.style.top = top + 'px';
-
-    el.querySelector('.nodemenu__x').onclick = closePopup;
-    el.querySelector('[data-copy]').onclick = async () => {
-      // 复制的一定是**全文**，不是画布上的截断标签
-      const d = await fetchDetail(node.id);
-      const text = (d && d.memory && d.memory.content) || inlineText(node.label || '');
-      try {
-        await navigator.clipboard.writeText(text);
-        toast(d && d.memory ? '已复制全文' : '已复制（只有截断文本）');
-      } catch {
-        toast('复制失败（浏览器不允许）', true);
-      }
-    };
-
-    // 标签是截断的，先把全文补上再显示
-    fetchDetail(node.id).then((d) => patchDetail(el, d));
-
-    popupEl = el;
-  }
-
-  canvas.addEventListener('contextmenu', (ev) => {
-    ev.preventDefault();
-    if (!layout) return;
-    const idx = hitTest(ev.clientX, ev.clientY);
-    if (idx < 0) { closePopup(); return; }
-    // 右键只弹预览框，不动侧栏（两个一起弹出来太挤）
-    showPopup(layout.nodes[idx], ev.clientX, ev.clientY);
-  });
 
   // 点别处（含画布）就收起弹层
   const onDocPointerDown = (ev) => {
@@ -1935,6 +1874,7 @@ function renderSettings() {
           <span class="label">连线方式</span>
           <select id="elMode" style="flex:0 1 280px">
             <option value="lexical">字词相似（自动，零成本）</option>
+            <option value="local">本地小模型（离线，不联网）</option>
             <option value="ai-dsh">AI 整理 · 用 DSH 里的模型</option>
             <option value="ai-key">AI 整理 · 用下面填的 key</option>
           </select>
@@ -1947,13 +1887,20 @@ function renderSettings() {
         <div class="row" id="elModelRow">
           <span class="label">整理模型</span>
           <input class="input" type="text" id="elModel" placeholder="如 qwen4-max" style="flex:1 1 220px" />
-          <span class="hint">复用上面 embedding 的端点和 key</span>
+          <span class="hint">复用上面 embedding 的端点和 key（本地小模型不用填）</span>
         </div>
         <div class="row" id="elStartRow">
           <label style="display:flex;gap:8px;align-items:center">
             <input type="checkbox" id="elOnStart" />
             <span>打开应用时也整理一次</span>
           </label>
+        </div>
+        <div class="row" style="border-top:1px solid var(--line);padding-top:10px">
+          <label style="display:flex;gap:8px;align-items:center">
+            <input type="checkbox" id="elContextFull" />
+            <span>上下文快满时提醒先整理记忆</span>
+          </label>
+          <span class="hint">常驻提示词里加一句：压缩历史前先把结论落盘</span>
         </div>
         <div class="row" style="border-top:1px solid var(--line);padding-top:10px">
           <button class="btn" id="elRun">立即整理一次</button>
@@ -2302,6 +2249,7 @@ function renderSettings() {
     $('elDays').value = String(feat0.eventLinkIntervalDays ?? 7);
     $('elModel').value = feat0.eventLinkModel || '';
     $('elOnStart').checked = feat0.eventLinkOnStart === true;
+    if ($('elContextFull')) $('elContextFull').checked = s.config.organizeOnContextFull !== false;
     elModelRow.style.display = (elMode.value === 'ai-key') ? '' : 'none';
     elStartRow.style.display = (elMode.value === 'ai-key') ? '' : 'none';
     $('mInfo').textContent = s.maintenance && s.maintenance.lastAt
@@ -2431,6 +2379,10 @@ function renderSettings() {
     $('elModel').addEventListener('change', async () => {
       try { await saveEventCfg({ eventLinkModel: $('elModel').value.trim() }); } catch (err) { toast('保存失败：' + err.message, true); }
     });
+    $('elContextFull').addEventListener('change', async () => {
+      try { await api('/config', { method: 'POST', body: JSON.stringify({ organizeOnContextFull: $('elContextFull').checked }) }); toast('已保存'); }
+      catch (err) { toast('保存失败：' + err.message, true); }
+    });
     $('elOnStart').addEventListener('change', async () => {
       try { await saveEventCfg({ eventLinkOnStart: $('elOnStart').checked }); } catch (err) { toast('保存失败：' + err.message, true); }
     });
@@ -2443,6 +2395,17 @@ function renderSettings() {
       }
       if (mode === 'lexical') {
         box.textContent = '字词相似是自动算的，不需要手动整理';
+        return;
+      }
+      if (mode === 'local') {
+        box.textContent = '本地小模型整理中（不联网）…';
+        try {
+          const r = await api('/event-links/local', { method: 'POST', body: JSON.stringify({}) });
+          box.textContent = '完成：候选 ' + (r.candidates || 0) + ' 对，写入 ' + (r.written || 0) + ' 条，库里共 ' + (r.total || 0) + ' 条连线';
+          await refreshMeta();
+        } catch (err) {
+          box.textContent = '失败：' + err.message;
+        }
         return;
       }
       box.textContent = '正在整理…';

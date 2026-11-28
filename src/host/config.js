@@ -59,6 +59,8 @@ export const DEFAULTS = {
   injectBrief: true,
   // 界面主题：dark 深色 / light 纯白 / warm 米白
   theme: 'dark',
+  // 上下文接近上限时，提醒模型先把重要结论写进记忆库
+  organizeOnContextFull: true,
 
   // v2 新增：可选 embedding（默认关闭，失败自动降级到 BM25）
   embedding: {
@@ -198,9 +200,24 @@ export function normalizeConfig(input) {
     if (key === 'features') {
       const f = value && typeof value === 'object' ? value : {};
       const feat = {};
-      // 只认布尔；没给的沿用默认（默认本身就是保守的）
+      // 按默认值的类型分别校验：布尔只认布尔，字符串/数字照收。
+      // 早先这里只认布尔，导致 eventLinkMode 这种字符串选项永远存不住。
       for (const [fk, def] of Object.entries(DEFAULTS.features)) {
-        feat[fk] = typeof f[fk] === 'boolean' ? f[fk] : def;
+        if (typeof def === 'boolean') {
+          feat[fk] = typeof f[fk] === 'boolean' ? f[fk] : def;
+        } else if (typeof def === 'string') {
+          if (fk === 'eventLinkMode') {
+            const v = String(f[fk] ?? '');
+            feat[fk] = ['lexical', 'local', 'ai-dsh', 'ai-key'].includes(v) ? v : def;
+          } else {
+            feat[fk] = typeof f[fk] === 'string' ? String(f[fk]).slice(0, 200) : def;
+          }
+        } else if (typeof def === 'number') {
+          const n2 = Number(f[fk]);
+          feat[fk] = Number.isFinite(n2) ? n2 : def;
+        } else {
+          feat[fk] = f[fk] === undefined ? def : f[fk];
+        }
       }
       out.features = feat;
       continue;
@@ -235,6 +252,11 @@ export function normalizeConfig(input) {
         if (Number.isFinite(n)) merged[k] = Math.min(3650, Math.max(7, Math.round(n)));
       }
       out.halfLifeDays = merged;
+      continue;
+    }
+
+    if (key === 'organizeOnContextFull') {
+      out.organizeOnContextFull = value !== false;
       continue;
     }
 
