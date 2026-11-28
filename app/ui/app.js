@@ -1902,7 +1902,17 @@ function renderSettings() {
             <input type="checkbox" id="elContextFull" />
             <span>上下文快满时提醒先整理记忆</span>
           </label>
-          <span class="hint">常驻提示词里加一句：压缩历史前先把结论落盘</span>
+          <span class="hint">只在真的用到阈值时注入一次提醒，不占常驻提示词</span>
+        </div>
+        <div class="row">
+          <span class="label">上下文容量</span>
+          <input class="input" type="number" id="elCtxWindow" min="1000" step="1000" style="width:110px" />
+          <span class="hint">token（不同模型不一样，按你用的填）</span>
+        </div>
+        <div class="row">
+          <span class="label">触发比例</span>
+          <input class="input" type="number" id="elCtxRatio" min="10" max="98" step="1" style="width:80px" />
+          <span class="hint">% ，用到这么多时提醒一次（每个会话最多一次）</span>
         </div>
         <div class="row" style="border-top:1px solid var(--line);padding-top:10px">
           <button class="btn" id="elRun">立即整理一次</button>
@@ -2253,6 +2263,8 @@ function renderSettings() {
     $('elModel').value = feat0.eventLinkModel || '';
     $('elOnStart').checked = feat0.eventLinkOnStart === true;
     if ($('elContextFull')) $('elContextFull').checked = s.config.organizeOnContextFull !== false;
+    if ($('elCtxWindow')) $('elCtxWindow').value = s.config.contextWindowTokens || 128000;
+    if ($('elCtxRatio')) $('elCtxRatio').value = Math.round((s.config.contextFullRatio || 0.75) * 100);
     elModelRow.style.display = (elMode.value === 'ai-key') ? '' : 'none';
     elStartRow.style.display = (elMode.value === 'ai-key') ? '' : 'none';
     $('mInfo').textContent = s.maintenance && s.maintenance.lastAt
@@ -2382,6 +2394,19 @@ function renderSettings() {
     $('elModel').addEventListener('change', async () => {
       try { await saveEventCfg({ eventLinkModel: $('elModel').value.trim() }); } catch (err) { toast('保存失败：' + err.message, true); }
     });
+    const saveCtx = async () => {
+      const win = Number($('elCtxWindow').value);
+      const pct = Number($('elCtxRatio').value);
+      try {
+        await api('/config', { method: 'POST', body: JSON.stringify({
+          contextWindowTokens: Number.isFinite(win) ? win : 128000,
+          contextFullRatio: Number.isFinite(pct) ? Math.min(0.98, Math.max(0.1, pct / 100)) : 0.75,
+        }) });
+        toast('已保存');
+      } catch (err) { toast('保存失败：' + err.message, true); }
+    };
+    $('elCtxWindow').addEventListener('change', saveCtx);
+    $('elCtxRatio').addEventListener('change', saveCtx);
     $('elContextFull').addEventListener('change', async () => {
       try { await api('/config', { method: 'POST', body: JSON.stringify({ organizeOnContextFull: $('elContextFull').checked }) }); toast('已保存'); }
       catch (err) { toast('保存失败：' + err.message, true); }

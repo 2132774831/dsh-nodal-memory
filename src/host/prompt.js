@@ -19,11 +19,6 @@ export function buildBrief(ctx) {
 
   const note = [];
 
-  // 上下文快满时先落盘：只加常驻提示，不发消息
-  if (config.organizeOnContextFull !== false) {
-    note.push('', '### 🧠 上下文快满时先落盘',
-      '压缩/截断历史之前，先把还没写进记忆库的结论用 `memory_save` 写下来（一条一个要点），再继续。');
-  }
 
   if (review && review.overdue) {
     note.push(

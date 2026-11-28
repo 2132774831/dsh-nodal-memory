@@ -81,8 +81,37 @@ export function renderRecall(results, now = Date.now(), getUpdates = null) {
  * @param {() => object} deps.getConfig
  * @returns {(payload:object, next:Function) => Promise<object>} agent/pre-step 处理器
  */
+/**
+ * 粗估 token 数：中日韩字符按 1 个算，其余按 3.5 字符 1 个算。
+ * 只用来判断"要不要提醒"，不需要精确。
+ */
+export function estimateTokens(messages) {
+  let cjk = 0;
+  let other = 0;
+  const walk = (v) => {
+    if (v == null) return;
+    if (typeof v === 'string') {
+      for (const ch of v) {
+        if (/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(ch)) cjk += 1;
+        else other += 1;
+      }
+      return;
+    }
+    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+    if (typeof v === 'object') {
+      if (typeof v.text === 'string') walk(v.text);
+      else if (typeof v.content === 'string') walk(v.content);
+      else if (Array.isArray(v.content)) walk(v.content);
+    }
+  };
+  walk(messages);
+  return Math.round(cjk + other / 3.5);
+}
+
 export function createRecallHandler(deps) {
   const injectedBySession = new Map();
+  // 「上下文快满」提醒：每个会话只提醒一次，不重复占历史
+  const contextWarnedSessions = new Set();
 
   return async function handle(payload, next) {
     const decision = await next();
@@ -144,41 +173,74 @@ export function createRecallHandler(deps) {
         } catch { /* 拿不到钉住的也不该影响正常回忆 */ }
       }
 
-      if (!results.length) return decision;
-
-      const text = renderRecall(results, Date.now(), store.getUpdates ? (id) => store.getUpdates(id) : null);
-
-      // 同会话内容完全相同 → 说明历史里已经有一份了，不再重复注入
       const sessionId = payload && payload.agent && payload.agent.id;
-      if (sessionId && injectedBySession.get(sessionId) === text) return decision;
-      if (sessionId) {
-        if (injectedBySession.size >= 200) {
-          const oldest = injectedBySession.keys().next().value;
-          if (oldest !== undefined) injectedBySession.delete(oldest);
+      const extra = [];
+
+      if (results.length) {
+        const text = renderRecall(results, Date.now(), store.getUpdates ? (id) => store.getUpdates(id) : null);
+
+        // 同会话内容完全相同 → 说明历史里已经有一份了，不再重复注入
+        const sameText = sessionId && injectedBySession.get(sessionId) === text;
+        if (!sameText) {
+          if (sessionId) {
+            if (injectedBySession.size >= 200) {
+              const oldest = injectedBySession.keys().next().value;
+              if (oldest !== undefined) injectedBySession.delete(oldest);
+            }
+            injectedBySession.set(sessionId, text);
+          }
+
+          for (const r of results) store.recordAccess(r.record.id, 'inject');
+
+          // 记共现：这些记忆是被**一起**注入的，这就是最实在的"它们相关"的证据。
+          // 数据不能补录，所以从第一天就要记。
+          if (typeof store.recordCooccur === 'function') {
+            store.recordCooccur(results.map((r) => r.record.id));
+          }
+
+          extra.push({
+            id: `${NS}:recall:${randomUUID()}`,
+            role: 'user',
+            content: [{ type: 'text', text }],
+            source: {
+              kind: NS,
+              form: 'recall',
+              memoryIds: results.map((r) => r.record.id),
+            },
+          });
         }
-        injectedBySession.set(sessionId, text);
       }
 
-      for (const r of results) store.recordAccess(r.record.id, 'inject');
-
-      // 记共现：这些记忆是被**一起**注入的，这就是最实在的"它们相关"的证据。
-      // 数据不能补录，所以从第一天就要记。
-      if (typeof store.recordCooccur === 'function') {
-        store.recordCooccur(results.map((r) => r.record.id));
+      /**
+       * 上下文快满时提醒整理记忆。
+       *
+       * 以前这条是**常驻在系统提示词**里的，每轮请求都要重发，白烧 token；
+       * 现在只在估算占用超过阈值时注入一条，且每个会话只提醒一次。
+       */
+      if (cfg.organizeOnContextFull !== false && sessionId && !contextWarnedSessions.has(sessionId)) {
+        const limit = Number(cfg.contextWindowTokens) > 0 ? Number(cfg.contextWindowTokens) : 128000;
+        const ratio = Number(cfg.contextFullRatio) > 0 ? Number(cfg.contextFullRatio) : 0.75;
+        const est = estimateTokens(messages);
+        if (est / limit >= ratio) {
+          if (contextWarnedSessions.size >= 500) contextWarnedSessions.clear();
+          contextWarnedSessions.add(sessionId);
+          const pct = Math.min(99, Math.round((est / limit) * 100));
+          const text = [
+            '【上下文提醒】这轮对话已用到约 ' + pct + '% 的上下文容量。',
+            '在继续之前，先把还没写进记忆库的结论用 `memory_save` 写下来（一条一个要点），',
+            '再继续压缩或推进——这样截断历史也不会丢结论。',
+          ].join('\n');
+          extra.push({
+            id: `${NS}:context-full:${randomUUID()}`,
+            role: 'user',
+            content: [{ type: 'text', text }],
+            source: { kind: NS, form: 'context-full', useRatio: Math.round((est / limit) * 1000) / 1000 },
+          });
+        }
       }
 
-      const injected = {
-        id: `${NS}:recall:${randomUUID()}`,
-        role: 'user',
-        content: [{ type: 'text', text }],
-        source: {
-          kind: NS,
-          form: 'recall',
-          memoryIds: results.map((r) => r.record.id),
-        },
-      };
-
-      return { ...decision, messages: [injected, ...messages] };
+      if (!extra.length) return decision;
+      return { ...decision, messages: [...extra, ...messages] };
     } catch {
       // 自动回忆是尽力而为：任何异常都安静放行，绝不能拖死这一轮
       return decision;

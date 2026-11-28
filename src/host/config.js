@@ -61,6 +61,10 @@ export const DEFAULTS = {
   theme: 'dark',
   // 上下文接近上限时，提醒模型先把重要结论写进记忆库
   organizeOnContextFull: true,
+  /** 模型的上下文容量（token）。用于判断"快满了没有"，不同模型可自己改 */
+  contextWindowTokens: 128000,
+  /** 用到多少比例时提醒整理（0.75 = 75%） */
+  contextFullRatio: 0.75,
 
   // v2 新增：可选 embedding（默认关闭，失败自动降级到 BM25）
   embedding: {
@@ -255,6 +259,18 @@ export function normalizeConfig(input) {
         if (Number.isFinite(n)) merged[k] = Math.min(3650, Math.max(7, Math.round(n)));
       }
       out.halfLifeDays = merged;
+      continue;
+    }
+
+    if (key === 'contextWindowTokens') {
+      const n2 = Number(value);
+      out.contextWindowTokens = Number.isFinite(n2) && n2 >= 1000 ? Math.round(n2) : DEFAULTS.contextWindowTokens;
+      continue;
+    }
+
+    if (key === 'contextFullRatio') {
+      const n2 = Number(value);
+      out.contextFullRatio = Number.isFinite(n2) && n2 > 0.1 && n2 <= 0.98 ? n2 : DEFAULTS.contextFullRatio;
       continue;
     }
 
