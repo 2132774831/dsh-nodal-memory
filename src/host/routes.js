@@ -233,7 +233,9 @@ function installIntoDsh() {
 
     // 2) 挂进 profile（改之前备份）
     const pkgFile = path.join(prof, 'package.json');
-    const raw = fs.readFileSync(pkgFile, 'utf8');
+    // profile 的 package.json 可能是记事本/PowerShell 写的（带 BOM），
+    // 直接 JSON.parse 会抛 "Unexpected token '﻿'"，装插件就失败了。先剥掉 BOM。
+    const raw = fs.readFileSync(pkgFile, 'utf8').replace(/^\uFEFF/, '');
     const pkg = JSON.parse(raw);
     fs.writeFileSync(pkgFile + '.lm-bak', raw, 'utf8');
 

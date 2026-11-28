@@ -46,13 +46,16 @@ static class InstallerCard
         try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "lm-install-trace.log"), DateTime.Now.ToString("s") + " boot args=" + string.Join("|", Environment.GetCommandLineArgs()) + "\r\n"); } catch { }
         // 自动化安装（给自己测安装流程用）：
         //   setup.exe /install="D:\xx"  → 不弹窗，直接装完退出，退出码 0/1
-        foreach (string a in Environment.GetCommandLineArgs())
+        //
+        // 注意：**不能**遍历 GetCommandLineArgs() 再取 /install= 那一项。
+        // 那个数组是按空格切开的：目标路径一旦含空格（或中文目录名里带空格），
+        // 就会被切成 "/install=C:\...\lm" + "安装" + "测试\..." 好几段，
+        // 结果装到半截路径、还照样返回 0（实测把桌面快捷方式都改坏了）。
+        // 正确做法：从整条命令行里截取，并优先认引号包起来的形式。
+        string installTarget = ParseInstallArg(Environment.CommandLine);
+        if (installTarget != null)
         {
-            if (a.StartsWith("/install=", StringComparison.OrdinalIgnoreCase))
-            {
-                string p = a.Substring("/install=".Length).Trim('"');
-                Environment.Exit(SilentInstall(p) ? 0 : 1);
-            }
+            Environment.Exit(SilentInstall(installTarget) ? 0 : 1);
         }
 
         Application.EnableVisualStyles();
@@ -265,6 +268,26 @@ static class InstallerCard
     }
 
     /// 无界面安装：解压 payload + 建快捷方式，返回是否成功
+    /// <summary>
+    /// 从完整命令行里取 /install= 后面的目标路径。
+    /// 支持三种写法：/install="C:\a b"、/install=C:\a b（取到行尾）、/install=C:\ab。
+    /// </summary>
+    static string ParseInstallArg(string commandLine)
+    {
+        if (string.IsNullOrEmpty(commandLine)) return null;
+        int k = commandLine.IndexOf("/install=", StringComparison.OrdinalIgnoreCase);
+        if (k < 0) return null;
+        string rest = commandLine.Substring(k + "/install=".Length);
+        rest = rest.Trim();
+        if (rest.StartsWith("\""))
+        {
+            int end = rest.IndexOf('"', 1);
+            rest = end > 0 ? rest.Substring(1, end - 1) : rest.Substring(1);
+        }
+        rest = rest.Trim().TrimEnd('"');
+        return rest.Length > 0 ? rest : null;
+    }
+
     static bool SilentInstall(string target)
     {
         try
